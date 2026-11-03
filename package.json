@@ -16,7 +16,7 @@
     "build": "tsc",
     "start": "node dist/index.js",
     "dev": "tsc --watch",
-    "test": "tsc && node --test tests/tax/*.test.mjs tests/subsidy/*.test.mjs tests/discovery.test.mjs tests/server.test.mjs",
+    "test": "tsc && node --test tests/tax/*.test.mjs tests/subsidy/*.test.mjs tests/perf/*.test.mjs tests/discovery.test.mjs tests/server.test.mjs",
     "test:integration": "AGENTLINK_REQUIRE_TAX_INTEGRATION=1 node --test tests/tax/real-integration.test.mjs",
     "test:integration:live": "node --test tests/tax/live-evidence-integration.mjs"
   },
