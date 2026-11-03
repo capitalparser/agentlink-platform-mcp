@@ -145,6 +145,10 @@ agentlink-mcp-server
 Verified tool contracts are required before domain tools are advertised.
 ```
 
+## Performance and stability
+
+Reusable building blocks (readiness cache, scope guard, tool execution isolation) and a measurement playbook are described in [docs/mcp-performance-playbook.md](docs/mcp-performance-playbook.md).
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
