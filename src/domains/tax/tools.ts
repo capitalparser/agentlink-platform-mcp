@@ -8,9 +8,11 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { RegisteredTool } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { toJsonSchemaCompat } from "@modelcontextprotocol/sdk/server/zod-json-schema-compat.js";
+import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
 import type { TaxDomainClientLike } from "./bridge.js";
-import { isBridgeError } from "./bridge.js";
+import { bridgeError, isBridgeError } from "./bridge.js";
 import type { ToolContract } from "../discovery.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 
 const NOTICE =
   " Results are review drafts. Per-payment withholding calculations are limited to explicitly selected business_lecture, other_lecture, business_personal_service, and other_personal_service profiles when complete user facts and matched current-law evidence are available; whole-matter applicability remains not_determined. The other_personal_service profile covers only three user-confirmed temporary payment types: manuscript_fee is 원고료 paid to the original author of a qualifying creative work under Article 21(1)(15)(a), not an 인세 royalty under (b) or a creative-work sale or other consideration under (c); expert_advisory is temporary paid use of professional knowledge or special skill under Article 21(1)(19)(c), excluding services under (15)–(17) and receipts of a professional practice or continuing business; broadcast_commentary is temporary explanation, enlightenment, or acting judging through radio, television, or analogous broadcasting media under Article 21(1)(19)(b), not generic committee judging, online content, performances, or consulting. For all three, the user must assert that the receipt is outside the other listed income types, professional-practice or continuing-business revenue, royalties, license fees, rights transfers or use, and inseparable mixed consideration; a one-off payment does not establish that classification. For the supported OTHER profiles, the statute permits actual necessary expenses above the 60% standard allowance, including an amount above gross. The calculator can use a user-supplied whole-won total only when the user confirms that it corresponds to this payment's current-period receipts, is ordinary and deductible, exceeds the 60% standard amount, is supported by records the payer can ascertain, and is within the existing 1,000,000,000,000,000-won input limit. This is an unverified user assertion: the calculator has not inspected or authenticated records and does not resolve allocation, depreciation, statutory limits, timing, duplication, or reimbursement questions. Computed actual rows use expense_method=actual, place the total in expense_amount, set expense_rate to null, and report any amount above gross separately as expense_excess_amount. When the signed payment-level OTHER difference is negative, the result keeps that negative value in income_amount, uses a zero withholding base and zero withholding for that payment, and leaves net_payment at gross. This payment-level calculation does not compute annual OTHER-income netting, cross-income offsets, loss carryforward, or refunds, and does not decide eligibility for them. The user-provided classifications remain unverified. The personal-service profile covers only these explicitly selected continuing independent services: authorship (저술 용역), artwork_design (도안 용역), illustration (삽화 용역), composition (작곡 용역), voice_acting (성우 용역), entertainment_direction (연예에 관한 연출 용역), entertainment_filming (연예에 관한 촬영 용역), proofreading (교정 용역), translation (번역 용역), and shorthand (속기 용역). Facts and calculations remain pending review, and no filing decision or submission is issued." +
@@ -22,6 +24,110 @@ const annotations = (openWorld: boolean) => ({
   idempotentHint: true,
   openWorldHint: openWorld,
 });
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+
+function canonicalJson(value: unknown): string | undefined {
+  const sortKeys = (item: unknown): unknown => {
+    if (Array.isArray(item)) return item.map(sortKeys);
+    if (isRecord(item)) {
+      return Object.fromEntries(Object.keys(item).sort().map((key) => [key, sortKeys(item[key])]));
+    }
+    return item;
+  };
+  try {
+    const serialized = JSON.stringify(sortKeys(value));
+    return typeof serialized === "string" ? serialized : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function hasExactKeys(value: Record<string, unknown>, expected: readonly string[]): boolean {
+  const keys = Object.keys(value);
+  return keys.length === expected.length && expected.every((key) => Object.hasOwn(value, key));
+}
+
+function isSafePractitionerNonAnswer(value: Record<string, unknown>): boolean {
+  if (hasExactKeys(value, ["error", "field"]) && value.error === "invalid_input" &&
+    typeof value.field === "string" && ["matter", "question", "conversation_state"].includes(value.field)) return true;
+  if (hasExactKeys(value, ["error", "field", "code", "available_focus_ids"]) &&
+    value.error === "invalid_input" && value.field === "guidance_focus" &&
+    value.code === "unsupported_guidance_focus" && Array.isArray(value.available_focus_ids)) {
+    const focusIds = value.available_focus_ids;
+    return focusIds.length > 0 && focusIds.length <= 20 &&
+      focusIds.every((focusId) => typeof focusId === "string" && /^[a-z][a-z0-9-]{0,79}$/.test(focusId)) &&
+      new Set(focusIds).size === focusIds.length;
+  }
+  return hasExactKeys(value, ["status", "provider"]) &&
+    value.status === "credential_missing" && value.provider === "law_go_kr_oc";
+}
+
+function taxDomainErrorResult(): CallToolResult {
+  const structuredContent = { ...bridgeError("TAX_DOMAIN_ERROR") };
+  return {
+    isError: true,
+    content: [{ type: "text", text: JSON.stringify(structuredContent) }],
+    structuredContent,
+  };
+}
+
+function projectPractitionerResult(result: CallToolResult, contracts: readonly ToolContract[]): CallToolResult {
+  if (!isRecord(result) || !CallToolResultSchema.safeParse(result).success) return taxDomainErrorResult();
+  if (result.isError === true || isBridgeError(result.structuredContent)) return result;
+  const source = result.structuredContent;
+  if (!isRecord(source)) return taxDomainErrorResult();
+
+  const sourceJson = canonicalJson(source);
+  if (sourceJson === undefined) return taxDomainErrorResult();
+  const matchingTextBlocks = new Set<number>();
+  for (const [index, block] of result.content.entries()) {
+    if (!isRecord(block) || block.type !== "text" || typeof block.text !== "string") continue;
+    try {
+      if (canonicalJson(JSON.parse(block.text)) === sourceJson) matchingTextBlocks.add(index);
+    } catch {
+      // Explanatory text blocks are preserved as-is.
+    }
+  }
+  if (matchingTextBlocks.size === 0) return taxDomainErrorResult();
+  if (source.schema_version !== "practitioner-answer.v1") {
+    return isSafePractitionerNonAnswer(source) ? result : taxDomainErrorResult();
+  }
+  if (!Array.isArray(source.next_actions)) return taxDomainErrorResult();
+
+  const domainNameByToolName = new Map<string, ToolContract>();
+  for (const contract of contracts) {
+    domainNameByToolName.set(contract.domainName, contract);
+    domainNameByToolName.set(contract.publicName, contract);
+  }
+
+  const nextActions: Record<string, unknown>[] = [];
+  for (const action of source.next_actions) {
+    if (!isRecord(action) || !Object.hasOwn(action, "tool")) return taxDomainErrorResult();
+    if (action.tool === null) {
+      nextActions.push(action);
+      continue;
+    }
+    if (!isRecord(action.tool) || typeof action.tool.name !== "string" || !isRecord(action.tool.arguments)) {
+      return taxDomainErrorResult();
+    }
+    const contract = domainNameByToolName.get(action.tool.name);
+    if (!contract) return taxDomainErrorResult();
+    nextActions.push({ ...action, tool: { ...action.tool, name: contract.publicName } });
+  }
+
+  const structuredContent = { ...source, next_actions: nextActions };
+  let text: string;
+  try {
+    text = JSON.stringify(structuredContent);
+  } catch {
+    return taxDomainErrorResult();
+  }
+  const content = result.content.map((block, index) =>
+    matchingTextBlocks.has(index) && isRecord(block) ? { ...block, text } : block);
+  return { ...result, content, structuredContent };
+}
 
 export interface RegisteredDomainTools {
   contracts: ToolContract[];
@@ -40,6 +146,10 @@ export function registerTaxDomainTools(server: McpServer, client: TaxDomainClien
   ) => {
     const handle = server.tool(name, description + NOTICE, shape, annotations(openWorld), async (args) => {
       const result = await client.callToolResult(domainTool, args as Record<string, unknown>);
+      if (domainTool === "answer_practitioner_question") {
+        const projected = projectPractitionerResult(result, contracts);
+        return { ...projected, ...(isBridgeError(projected.structuredContent) ? { isError: true } : {}) };
+      }
       return { ...result, ...(isBridgeError(result.structuredContent) ? { isError: true } : {}) };
     });
     handle.disable();
@@ -95,11 +205,13 @@ export function registerTaxDomainTools(server: McpServer, client: TaxDomainClien
     }, true);
 
   reg("tax_get_law_article", "get_law_article",
-    "Fetch current official text for one statute article; this does not establish historical wording, applicability, or completed text verification (법령 조문 본문 조회, 과거 문구·적용 여부·원문 대조 완료를 확정하지 않음).",
+    "Fetch current official text for one statute article. Optional lookup_basis selects promulgation or effective wording; when omitted, the child keeps its promulgation default. Effective lookup requires an explicit numeric law_id. This does not establish historical wording, applicability, or completed text verification (법령 조문 본문 조회. lookup_basis는 공포 또는 시행 기준을 선택하며 생략 시 하위 도구의 공포 기준 기본값을 유지합니다. 시행 기준 조회에는 숫자 법령 ID가 필요합니다. 과거 문구·적용 여부·원문 대조 완료를 확정하지 않음).",
     {
       law_name: z.string().min(1).max(100).describe("Law name (법령명)"),
       article: z.string().min(1).max(20).describe("Article locator (조문 위치)"),
       law_id: z.string().max(10).nullable().optional().describe("Optional law ID from tax_search_law (법령 ID)"),
+      lookup_basis: z.enum(["promulgation", "effective"]).optional()
+        .describe("Optional lookup basis; omitted preserves the child default (promulgation). effective requires a numeric law_id (조회 기준, 생략 시 하위 도구의 공포 기준 기본값 유지; 시행 기준에는 숫자 법령 ID 필요)"),
     }, true);
 
   reg("tax_check_business_status", "check_business_status",

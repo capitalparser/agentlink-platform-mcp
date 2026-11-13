@@ -1,20 +1,36 @@
-// Optional installed-package integration. Run after `npm run build` with the
-// tax wheel (which carries its canonical registry) installed.
+// Optional installed-package integration. Run with an installed tax wheel
+// (which carries its canonical registry) and a selected upper entry point.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import {
+  assertWorkflowMatrix,
+  FOCUS_EXPECTATIONS,
+  GUIDANCE_CAPABILITIES,
+  WORKFLOW_EXPECTATIONS,
+} from "./fixtures/review-expectations.mjs";
 
 const python = process.env.AGENTLINK_TEST_TAX_PYTHON;
 const registry = process.env.AGENTLINK_TEST_TAX_REGISTRY;
+const upperEntry = process.env.AGENTLINK_TEST_UPPER_ENTRY;
 const missingPython = !python || !existsSync(python);
 const invalidOverride = registry !== undefined && !existsSync(registry);
+const invalidUpperEntry = upperEntry !== undefined && (!isAbsolute(upperEntry) || !isFile(upperEntry));
 const required = process.env.AGENTLINK_REQUIRE_TAX_INTEGRATION === "1";
 const STDERR_LIMIT = 8 * 1024;
+
+function isFile(path) {
+  try {
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
 
 function payment(overrides = {}) {
   return {
@@ -38,12 +54,16 @@ function matter({ approval = false, payments = [payment()], workflowId = "withho
   };
 }
 
-test("installed tax child completes a withholding roundtrip through upper MCP stdio", {
+test("installed tax child matches the native and upper review matrix over MCP stdio", {
   timeout: 90_000,
-  skip: missingPython && !required && !invalidOverride
+  skip: missingPython && !required && !invalidOverride && !invalidUpperEntry && upperEntry === undefined
     ? "Set AGENTLINK_TEST_TAX_PYTHON to run the installed tax integration."
     : false,
 }, async () => {
+  if (required) {
+    assert.equal(registry, undefined,
+      "AGENTLINK_REQUIRE_TAX_INTEGRATION=1 forbids AGENTLINK_TEST_TAX_REGISTRY");
+  }
   assert.ok(python && existsSync(python), "AGENTLINK_TEST_TAX_PYTHON must name an installed tax-wheel interpreter");
   if (registry !== undefined) {
     assert.ok(existsSync(registry), "AGENTLINK_TEST_TAX_REGISTRY was explicitly set but does not exist");
@@ -51,42 +71,72 @@ test("installed tax child completes a withholding roundtrip through upper MCP st
   if (required) {
     assert.equal(process.env.PYTHONPATH, undefined, "installed mode must not receive a source PYTHONPATH");
     assert.equal(process.env.PYTHONHOME, undefined, "installed mode must not receive a Python home override");
+    assert.ok(upperEntry !== undefined,
+      "AGENTLINK_REQUIRE_TAX_INTEGRATION=1 requires an explicit AGENTLINK_TEST_UPPER_ENTRY");
   }
 
   const root = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
-  const serverPath = join(root, "dist", "index.js");
-  assert.ok(existsSync(serverPath), "build the upper MCP server before running this integration");
+  if (upperEntry !== undefined) {
+    assert.ok(isAbsolute(upperEntry), "AGENTLINK_TEST_UPPER_ENTRY must be an absolute file path");
+    assert.ok(isFile(upperEntry), "AGENTLINK_TEST_UPPER_ENTRY must name an existing file");
+  }
+  const serverPath = upperEntry ?? join(root, "dist", "index.js");
+  assert.ok(isFile(serverPath), "the selected upper MCP entry point must be an existing file");
 
   const scratch = mkdtempSync(join(tmpdir(), "agentlink-tax-only-integration-"));
+  const credentialsPath = join(scratch, "intentionally-missing-credentials.json");
   const childEnv = {
     PATH: process.env.PATH ?? "",
     HOME: scratch,
     TMPDIR: scratch,
     AGENTLINK_TAX_MCP_COMMAND: python,
     AGENTLINK_TAX_MCP_ARGS: JSON.stringify(["-I", "-B", "-m", "agentlink_tax.server"]),
-    AGENTLINK_CREDENTIALS_PATH: join(scratch, "intentionally-missing-credentials.json"),
+    AGENTLINK_CREDENTIALS_PATH: credentialsPath,
   };
   if (registry !== undefined) childEnv.AGENTLINK_TAX_REGISTRY = registry;
-  const transport = new StdioClientTransport({
+  const upperTransport = new StdioClientTransport({
     command: process.execPath,
     args: [serverPath],
     cwd: scratch,
     stderr: "pipe",
     env: childEnv,
   });
-  const client = new Client({ name: "agentlink-tax-real-integration", version: "0.1.0" });
+  const nativeEnv = {
+    PATH: process.env.PATH ?? "",
+    HOME: scratch,
+    TMPDIR: scratch,
+    AGENTLINK_CREDENTIALS_PATH: credentialsPath,
+  };
+  if (registry !== undefined) nativeEnv.AGENTLINK_TAX_REGISTRY = registry;
+  const nativeTransport = new StdioClientTransport({
+    command: python,
+    args: ["-I", "-B", "-m", "agentlink_tax.server"],
+    cwd: scratch,
+    stderr: "pipe",
+    env: nativeEnv,
+  });
+  const upperClient = new Client({ name: "agentlink-tax-upper-integration", version: "0.1.0" });
+  const nativeClient = new Client({ name: "agentlink-tax-native-integration", version: "0.1.0" });
   let upperStderr = "";
-  transport.stderr?.on("data", (chunk) => {
-    if (upperStderr.length < STDERR_LIMIT) {
-      upperStderr += String(chunk).slice(0, STDERR_LIMIT - upperStderr.length);
+  let nativeStderr = "";
+  const captureStderr = (transport, setText) => transport.stderr?.on("data", (chunk) => {
+    if (setText.value.length < STDERR_LIMIT) {
+      setText.value += String(chunk).slice(0, STDERR_LIMIT - setText.value.length);
     }
   });
+  const upperStderrCapture = { get value() { return upperStderr; }, set value(value) { upperStderr = value; } };
+  const nativeStderrCapture = { get value() { return nativeStderr; }, set value(value) { nativeStderr = value; } };
+  captureStderr(upperTransport, upperStderrCapture);
+  captureStderr(nativeTransport, nativeStderrCapture);
 
   let passed = false;
   try {
-    await client.connect(transport);
+    await Promise.all([
+      upperClient.connect(upperTransport),
+      nativeClient.connect(nativeTransport),
+    ]);
 
-    const call = async (name, args = {}) => {
+    const callSurface = async (client, name, args = {}) => {
       const response = await client.callTool({ name, arguments: args });
       assert.notEqual(response.isError, true, `${name} returned an MCP error: ${JSON.stringify(response)}`);
       assert.ok(response.structuredContent && typeof response.structuredContent === "object",
@@ -97,15 +147,35 @@ test("installed tax child completes a withholding roundtrip through upper MCP st
         `${name} text and structuredContent should carry the same domain result`);
       return response.structuredContent;
     };
+    const call = (name, args = {}) => callSurface(upperClient, name, args);
+    const callNative = (name, args = {}) => callSurface(nativeClient, name, args);
 
-    const { tools } = await client.listTools();
+    const [{ tools }, { tools: nativeTools }] = await Promise.all([
+      upperClient.listTools(),
+      nativeClient.listTools(),
+    ]);
     const names = tools.map((tool) => tool.name);
+    const nativeNames = nativeTools.map((tool) => tool.name);
     const taxNames = names.filter((name) => name.startsWith("tax_"));
     const bridgeStatus = await call("agentlink_bridge_status");
     assert.equal(taxNames.length, 19,
       `all mapped tax tools should be exposed after real child discovery; status=${JSON.stringify(bridgeStatus)}; tools=${names.join(",")}`);
+    const lawArticleTool = tools.find((tool) => tool.name === "tax_get_law_article");
+    assert.ok(lawArticleTool, "the public law article tool should be advertised");
+    assert.deepEqual(lawArticleTool.inputSchema.properties.lookup_basis.enum, ["promulgation", "effective"]);
+    assert.ok(!lawArticleTool.inputSchema.required?.includes("lookup_basis"),
+      "lookup_basis remains optional in the installed upper contract");
+    const nativeLawArticleTool = nativeTools.find((tool) => tool.name === "get_law_article");
+    assert.ok(nativeLawArticleTool, "the native law article tool should be advertised");
+    assert.deepEqual(nativeLawArticleTool.inputSchema.properties.lookup_basis.enum, ["promulgation", "effective"]);
+    assert.ok(!nativeLawArticleTool.inputSchema.required?.includes("lookup_basis"),
+      "lookup_basis remains optional in the native contract");
     for (const name of ["tax_list_workflows", "tax_get_workflow_contract", "tax_plan_work"]) {
       assert.ok(names.includes(name), `missing ${name}`);
+    }
+    for (const name of ["list_tax_workflows", "get_workflow_contract", "plan_tax_work",
+      "answer_practitioner_question", "get_law_article"]) {
+      assert.ok(nativeNames.includes(name), `native tools/list is missing ${name}`);
     }
     assert.ok(names.includes("agentlink_bridge_status"), "the bridge status tool should remain available");
     assert.ok(names.every((name) => name === "agentlink_bridge_status" || name.startsWith("tax_")),
@@ -113,19 +183,57 @@ test("installed tax child completes a withholding roundtrip through upper MCP st
     assert.ok(!names.some((name) => name.startsWith("subsidy_")), "the optional subsidy domain must stay absent");
 
     const plan = (taxMatter) => call("tax_plan_work", { matter: taxMatter, include_evidence: false });
+    const planNative = (taxMatter) => callNative("plan_tax_work", { matter: taxMatter, include_evidence: false });
 
-    const workflowList = await call("tax_list_workflows");
+    const [workflowList, nativeWorkflowList] = await Promise.all([
+      call("tax_list_workflows"),
+      callNative("list_tax_workflows"),
+    ]);
     assert.equal(workflowList.domain, "tax");
-    assert.equal(workflowList.workflows.length, 9);
-    assert.deepEqual(workflowList.workflows.filter((item) => item.status === "implemented").map((item) => item.id),
-      ["withholding-payment"]);
+    assertWorkflowMatrix(workflowList.workflows);
+    assertWorkflowMatrix(nativeWorkflowList.workflows);
+    const workflowProjection = ({ workflows }) => workflows.map(({ id, status, capabilities }) => ({
+      id, status, capabilities,
+    }));
+    assert.deepEqual(workflowProjection(nativeWorkflowList), workflowProjection(workflowList),
+      "native and upper workflow status/capability matrices should match");
     const contractOnly = workflowList.workflows.filter((item) => item.status === "contract_only");
-    assert.equal(contractOnly.length, 8);
+    assert.equal(contractOnly.length, 10);
     assert.ok(contractOnly.some((item) => item.id === "vat-return"), "VAT remains contract-only");
 
-    const contract = await call("tax_get_workflow_contract", { workflow_id: "withholding-payment" });
+    const nativeContracts = new Map();
+    const upperContracts = new Map();
+    for (const expected of WORKFLOW_EXPECTATIONS) {
+      const [nativeContract, upperContract] = await Promise.all([
+        callNative("get_workflow_contract", { workflow_id: expected.id }),
+        call("tax_get_workflow_contract", { workflow_id: expected.id }),
+      ]);
+      for (const [surface, workflowContract] of [["native", nativeContract], ["upper", upperContract]]) {
+        assert.equal(workflowContract.id, expected.id, `${surface} ${expected.id} contract ID mismatch`);
+        assert.equal(workflowContract.status, expected.status,
+          `${surface} ${expected.id} contract status mismatch`);
+        assert.deepEqual(workflowContract.capabilities, expected.capabilities,
+          `${surface} ${expected.id} contract capabilities mismatch`);
+        if (expected.status === "contract_only") {
+          assert.equal(workflowContract.guidance_contract?.schema, "tax-task-guidance.v1",
+            `${surface} ${expected.id} guidance contract schema mismatch`);
+          assert.deepEqual(workflowContract.guidance_contract?.available_focus_ids,
+            FOCUS_EXPECTATIONS.filter((item) => item.workflow_id === expected.id).map((item) => item.focus),
+            `${surface} ${expected.id} guidance focus contract mismatch`);
+        }
+      }
+      assert.equal(nativeContract.status, upperContract.status,
+        `${expected.id} contract status should match across surfaces`);
+      assert.deepEqual(nativeContract.capabilities, upperContract.capabilities,
+        `${expected.id} contract capabilities should match across surfaces`);
+      nativeContracts.set(expected.id, nativeContract);
+      upperContracts.set(expected.id, upperContract);
+    }
+    const [contract, nativeContract] = [upperContracts.get("withholding-payment"), nativeContracts.get("withholding-payment")];
     assert.equal(contract.id, "withholding-payment");
     assert.equal(contract.status, "implemented");
+    assert.deepEqual(nativeContract.facts_schema, contract.facts_schema,
+      "the upper bridge should preserve the native withholding facts schema");
     const paymentRef = contract.facts_schema?.properties?.payments?.items?.$ref;
     assert.match(paymentRef ?? "", /^#\/\$defs\//,
       "the upper bridge should preserve the native payment schema reference");
@@ -221,35 +329,164 @@ test("installed tax child completes a withholding roundtrip through upper MCP st
     assert.ok(nonresident.unresolved.some((item) => item.code === "NONRESIDENT_PAYMENT_REVIEW"));
     assert.ok(!nonresident.next_actions.some((action) => action.due_date));
 
-    for (const workflow of contractOnly) {
-      const result = await plan({
-        matter_id: "p0-test",
-        workflow_id: workflow.id,
-        as_of: "2026-04-01",
-      });
-      assert.equal(result.status, "contract_only", `${workflow.id} should remain intake-only`);
+    const guidanceMatter = (workflowId, focus) => ({
+      matter_id: `review-${workflowId}-${focus ?? "overview"}`,
+      workflow_id: workflowId,
+      as_of: "2026-04-01",
+      facts: focus ? { guidance_focus: focus } : {},
+    });
+    const assertPreparationPlan = (result, workflowId, focusIds, expectedFocusRows) => {
+      assert.equal(result.status, "contract_only", `${workflowId} should remain guidance-only`);
       assert.ok(result.unresolved.some((item) => item.code === "WORKFLOW_NOT_IMPLEMENTED"));
       assert.deepEqual(result.why, []);
-      assert.deepEqual(result.next_actions, []);
+      assert.ok(Array.isArray(result.next_actions) && result.next_actions.length > 0,
+        `${workflowId} must retain preparation next_actions`);
+      assert.ok(!result.withholding_calculations?.length,
+        `${workflowId} must not produce withholding calculations`);
+      assert.deepEqual(result.task_guidance.selected_focus_ids, focusIds,
+        `${workflowId} selected focus mismatch`);
+      assert.deepEqual(result.task_guidance.capabilities, GUIDANCE_CAPABILITIES,
+        `${workflowId} guidance capabilities mismatch`);
+      assert.deepEqual(result.task_guidance.sources.map((source) => ({ law_id: source.law_id, article: source.locator })),
+        expectedFocusRows.map(({ law_id, article }) => ({ law_id, article })),
+        `${workflowId} guidance source mapping mismatch`);
+    };
+    const assertPlanPair = (nativePlan, upperPlan, context) => {
+      assert.equal(nativePlan.status, upperPlan.status, `${context} plan status should match across surfaces`);
+      assert.deepEqual(nativePlan.task_guidance.capabilities, upperPlan.task_guidance.capabilities,
+        `${context} plan capabilities should match across surfaces`);
+      assert.deepEqual(nativePlan.task_guidance.selected_focus_ids, upperPlan.task_guidance.selected_focus_ids,
+        `${context} plan focus IDs should match across surfaces`);
+    };
+    const assertPractitionerGuidance = (answer, expectedFocusRow, context, toolName, toolNames) => {
+      assert.equal(answer.schema_version, "practitioner-answer.v1");
+      assert.equal(answer.final_decision, "not_issued");
+      assert.equal(answer.applicability, "not_determined");
+      assert.ok(Array.isArray(answer.next_actions) && answer.next_actions.length > 0,
+        `${context} must retain practitioner next_actions`);
+      const articleAction = answer.next_actions.find((action) => action.tool?.name === toolName);
+      assert.ok(articleAction, `${context} should expose root action ${toolName}`);
+      assert.ok(toolNames.includes(toolName), `${context} selected tool must appear in its surface's tools/list`);
+      const args = articleAction.tool.arguments;
+      assert.ok(args && typeof args === "object" && !Array.isArray(args), `${context} action arguments must be an object`);
+      assert.deepEqual(Object.keys(args).sort(), ["article", "law_id", "law_name", "lookup_basis"],
+        `${context} must preserve exactly the four lookup arguments`);
+      assert.equal(typeof args.law_name, "string");
+      assert.ok(args.law_name.length > 0, `${context} law name must be present`);
+      assert.equal(args.law_id, expectedFocusRow.law_id, `${context} law ID mismatch`);
+      assert.equal(args.article, expectedFocusRow.article, `${context} article mismatch`);
+      assert.equal(args.lookup_basis, "effective", `${context} lookup basis mismatch`);
+      return { name: articleAction.tool.name, arguments: args };
+    };
+    const assertPractitionerPair = async (nativeAnswer, upperAnswer, expectedFocusRow, context) => {
+      const nativeAction = assertPractitionerGuidance(
+        nativeAnswer, expectedFocusRow, `${context} native`, "get_law_article", nativeNames,
+      );
+      const upperAction = assertPractitionerGuidance(
+        upperAnswer, expectedFocusRow, `${context} upper`, "tax_get_law_article", names,
+      );
+      assert.deepEqual(nativeAction.arguments, upperAction.arguments,
+        `${context} lookup arguments should match across surfaces`);
+      assert.equal(nativeAnswer.final_decision, upperAnswer.final_decision,
+        `${context} practitioner decision status should match across surfaces`);
+      assert.equal(nativeAnswer.applicability, upperAnswer.applicability,
+        `${context} practitioner applicability should match across surfaces`);
+      const [nativeLookup, upperLookup] = await Promise.all([
+        callNative(nativeAction.name, nativeAction.arguments),
+        call(upperAction.name, upperAction.arguments),
+      ]);
+      assert.equal(nativeLookup.status, "credential_missing", `${context} native lookup should be credential-gated`);
+      assert.equal(upperLookup.status, "credential_missing", `${context} upper lookup should be credential-gated`);
+    };
+
+    const expectedGuidanceWorkflows = WORKFLOW_EXPECTATIONS.filter((item) => item.status === "contract_only");
+    for (const workflow of expectedGuidanceWorkflows) {
+      const expectedFocusRows = FOCUS_EXPECTATIONS.filter((item) => item.workflow_id === workflow.id);
+      assert.equal(expectedFocusRows.length, 2, `${workflow.id} should have two independent focus expectations`);
+
+      const overviewMatter = guidanceMatter(workflow.id);
+      const [overviewPlan, nativeOverviewPlan] = await Promise.all([
+        plan(overviewMatter), planNative(overviewMatter),
+      ]);
+      assertPreparationPlan(overviewPlan, workflow.id, expectedFocusRows.map(({ focus }) => focus), expectedFocusRows);
+      assertPreparationPlan(nativeOverviewPlan, workflow.id, expectedFocusRows.map(({ focus }) => focus), expectedFocusRows);
+      assertPlanPair(nativeOverviewPlan, overviewPlan, `${workflow.id} overview`);
+      const [overviewAnswer, nativeOverviewAnswer] = await Promise.all([
+        call("tax_answer_practitioner_question", { matter: overviewMatter, include_evidence: false }),
+        callNative("answer_practitioner_question", { matter: overviewMatter, include_evidence: false }),
+      ]);
+      await assertPractitionerPair(nativeOverviewAnswer, overviewAnswer, expectedFocusRows[0], `${workflow.id} overview`);
+
+      for (const focusRow of expectedFocusRows) {
+        const focusMatter = guidanceMatter(workflow.id, focusRow.focus);
+        const [focusPlan, nativeFocusPlan] = await Promise.all([
+          plan(focusMatter), planNative(focusMatter),
+        ]);
+        assertPreparationPlan(focusPlan, workflow.id, [focusRow.focus], [focusRow]);
+        assertPreparationPlan(nativeFocusPlan, workflow.id, [focusRow.focus], [focusRow]);
+        assertPlanPair(nativeFocusPlan, focusPlan, `${workflow.id}/${focusRow.focus}`);
+        const [focusAnswer, nativeFocusAnswer] = await Promise.all([
+          call("tax_answer_practitioner_question", { matter: focusMatter, include_evidence: false }),
+          callNative("answer_practitioner_question", { matter: focusMatter, include_evidence: false }),
+        ]);
+        await assertPractitionerPair(
+          nativeFocusAnswer, focusAnswer, focusRow, `${workflow.id}/${focusRow.focus}`,
+        );
+      }
     }
 
-    const unknownWorkflow = await plan({
+    const unknownMatter = {
       matter_id: "p0-test",
       workflow_id: "p0-unknown-workflow",
       as_of: "2026-04-01",
-    });
+    };
+    const [unknownWorkflow, nativeUnknownWorkflow] = await Promise.all([
+      plan(unknownMatter), planNative(unknownMatter),
+    ]);
     assert.equal(unknownWorkflow.status, "invalid_input");
+    assert.equal(nativeUnknownWorkflow.status, "invalid_input");
+    assert.equal(nativeUnknownWorkflow.status, unknownWorkflow.status,
+      "unknown workflow errors should match across surfaces");
+    const [unknownAnswer, nativeUnknownAnswer] = await Promise.all([
+      call("tax_answer_practitioner_question", { matter: unknownMatter, include_evidence: false }),
+      callNative("answer_practitioner_question", { matter: unknownMatter, include_evidence: false }),
+    ]);
+    assert.equal(unknownAnswer.error, "invalid_input");
+    assert.equal(nativeUnknownAnswer.error, "invalid_input");
+    assert.equal(nativeUnknownAnswer.field, unknownAnswer.field,
+      "unknown workflow answer errors should match across surfaces");
+    const invalidFocusMatter = guidanceMatter("vat-return", "unsupported-focus");
+    const [invalidFocus, nativeInvalidFocus] = await Promise.all([
+      plan(invalidFocusMatter), planNative(invalidFocusMatter),
+    ]);
+    assert.equal(invalidFocus.status, "invalid_input");
+    assert.equal(nativeInvalidFocus.status, "invalid_input");
+    assert.equal(nativeInvalidFocus.status, invalidFocus.status,
+      "invalid focus errors should match across surfaces");
+    const [invalidFocusAnswer, nativeInvalidFocusAnswer] = await Promise.all([
+      call("tax_answer_practitioner_question", { matter: invalidFocusMatter, include_evidence: false }),
+      callNative("answer_practitioner_question", { matter: invalidFocusMatter, include_evidence: false }),
+    ]);
+    assert.equal(invalidFocusAnswer.error, "invalid_input");
+    assert.equal(nativeInvalidFocusAnswer.error, "invalid_input");
+    assert.equal(invalidFocusAnswer.code, "unsupported_guidance_focus");
+    assert.equal(nativeInvalidFocusAnswer.code, invalidFocusAnswer.code,
+      "invalid focus answer errors should match across surfaces");
     passed = true;
   } catch (error) {
-    const stderrPath = join(scratch, "upper.stderr.log");
-    writeFileSync(stderrPath, upperStderr || "<no upper-server stderr captured>\n", "utf8");
+    const upperStderrPath = join(scratch, "upper.stderr.log");
+    const nativeStderrPath = join(scratch, "native.stderr.log");
+    writeFileSync(upperStderrPath, upperStderr || "<no upper-server stderr captured>\n", "utf8");
+    writeFileSync(nativeStderrPath, nativeStderr || "<no native-server stderr captured>\n", "utf8");
     if (error instanceof Error) {
-      error.message = `${error.message}\nBounded upper-server stderr saved locally at ${stderrPath}`;
+      error.message = `${error.message}\nBounded server stderr saved locally at ${upperStderrPath} and ${nativeStderrPath}`;
     }
     throw error;
   } finally {
-    await client.close().catch(() => {});
-    await transport.close().catch(() => {});
+    await upperClient.close().catch(() => {});
+    await upperTransport.close().catch(() => {});
+    await nativeClient.close().catch(() => {});
+    await nativeTransport.close().catch(() => {});
     if (passed) rmSync(scratch, { recursive: true, force: true });
   }
 });

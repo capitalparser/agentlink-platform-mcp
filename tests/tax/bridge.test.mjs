@@ -9,9 +9,11 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createServer } from "../../dist/server.js";
+import { discoverAndVerifyTools } from "../../dist/domains/discovery.js";
 import { TaxDomainClient } from "../../dist/domains/tax/bridge.js";
 import { registerTaxDomainTools } from "../../dist/domains/tax/tools.js";
 import { memoryDomainClient, genericContracts } from "./fixtures/memory-domain-client.mjs";
+import { assertWorkflowMatrix, FOCUS_EXPECTATIONS, WORKFLOW_EXPECTATIONS } from "./fixtures/review-expectations.mjs";
 
 const TAX_TOOLS = [
   "tax_list_workflows", "tax_get_workflow_contract", "tax_plan_work", "tax_get_automation_offer",
@@ -24,6 +26,16 @@ const TAX_TOOLS = [
 
 async function connect(taxDomainClient) {
   const server = await createServer({ taxDomainClient: memoryDomainClient(taxDomainClient), demo: true });
+  const [a, b] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "t", version: "0" });
+  await Promise.all([server.connect(a), client.connect(b)]);
+  return { server, client };
+}
+
+async function connectWithCallToolResult(callToolResult) {
+  const domain = memoryDomainClient();
+  domain.callToolResult = callToolResult;
+  const server = await createServer({ taxDomainClient: domain, demo: true });
   const [a, b] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "t", version: "0" });
   await Promise.all([server.connect(a), client.connect(b)]);
@@ -52,9 +64,10 @@ test("tool list has 19 read-only tax tools; signed calculation content passes th
   };
   const payload = { automation_offer, status: "weird", nested: { applicability: "applies", due: "2026-01-01" },
     calculation: { income_amount: "-200000", expense_excess_amount: "200000" }, n: [1, 2] };
+  const answerPayload = { ...payload, schema_version: "practitioner-answer.v1", next_actions: [] };
   const calls = [];
   const fake = {
-    async callTool(name, args) { calls.push([name, args]); return payload; },
+    async callTool(name, args) { calls.push([name, args]); return name === "answer_practitioner_question" ? answerPayload : payload; },
     async close() {},
   };
   const { client } = await connect(fake);
@@ -79,8 +92,9 @@ test("tool list has 19 read-only tax tools; signed calculation content passes th
   for (const name of ["tax_answer_practitioner_question", "tax_export_rule_cards"]) {
     const args = name === "tax_answer_practitioner_question" ? { matter: {} } : {};
     const result = await client.callTool({ name, arguments: args });
-    assert.deepEqual(result.structuredContent, payload);
-    assert.deepEqual(JSON.parse(result.content[0].text), payload);
+    const expected = name === "tax_answer_practitioner_question" ? answerPayload : payload;
+    assert.deepEqual(result.structuredContent, expected);
+    assert.deepEqual(JSON.parse(result.content[0].text), expected);
     assert.equal(tools.find((t) => t.name === name).annotations.openWorldHint,
       name === "tax_answer_practitioner_question");
   }
@@ -350,6 +364,295 @@ test("new tax tools forward arguments, apply defaults and reject out-of-range in
   assert.equal(calls.length, n, "invalid input must not reach the domain");
 });
 
+test("public law lookup accepts optional lookup basis and forwards it unchanged", async () => {
+  const calls = [];
+  const fake = { async callTool(name, args) { calls.push([name, args]); return { status: "ok" }; }, async close() {} };
+  const { client } = await connect(fake);
+  const call = (args) => client.callTool({ name: "tax_get_law_article", arguments: args });
+  try {
+    const { tools } = await client.listTools();
+    const schema = tools.find((tool) => tool.name === "tax_get_law_article").inputSchema;
+    assert.deepEqual(schema.properties.lookup_basis?.enum, ["promulgation", "effective"]);
+    assert.ok(!schema.required?.includes("lookup_basis"), "lookup_basis must remain optional");
+    assert.equal(schema.properties.lookup_basis?.default, undefined, "the upper schema must not insert a default");
+
+    await call({ law_name: "소득세법", article: "제70조" });
+    await call({ law_name: "소득세법", article: "제70조", lookup_basis: "promulgation" });
+    await call({ law_name: "소득세법", article: "제70조", lookup_basis: "effective" });
+    assert.deepEqual(calls, [
+      ["get_law_article", { law_name: "소득세법", article: "제70조" }],
+      ["get_law_article", { law_name: "소득세법", article: "제70조", lookup_basis: "promulgation" }],
+      ["get_law_article", { law_name: "소득세법", article: "제70조", lookup_basis: "effective" }],
+    ]);
+
+    const beforeInvalid = calls.length;
+    for (const lookup_basis of ["latest", null, 1]) {
+      let rejected = false;
+      try { rejected = (await call({ law_name: "소득세법", article: "제70조", lookup_basis })).isError === true; }
+      catch { rejected = true; }
+      assert.ok(rejected, `invalid lookup_basis ${JSON.stringify(lookup_basis)} should be rejected`);
+    }
+    assert.equal(calls.length, beforeInvalid, "invalid lookup basis must not reach the domain");
+  } finally {
+    await client.close();
+  }
+});
+
+test("lookup basis schema compatibility accepts old upper with new child but rejects new upper with old child", async () => {
+  const schemaSource = new McpServer({ name: "tax-contract-source", version: "0" });
+  const contracts = registerTaxDomainTools(schemaSource, {
+    setStatusListener() {},
+    async callToolResult() { return { content: [{ type: "text", text: "{}" }], structuredContent: {} }; },
+  }).contracts;
+  const newContract = contracts.find((item) => item.domainName === "get_law_article");
+  assert.ok(newContract);
+  const oldUpperContract = structuredClone(newContract);
+  delete oldUpperContract.inputSchema.properties.lookup_basis;
+
+  const childWithNewSchema = {
+    async listTools() { return { tools: [{ name: "get_law_article", inputSchema: newContract.inputSchema }] }; },
+  };
+  await discoverAndVerifyTools(childWithNewSchema, [oldUpperContract], 1000);
+
+  const childWithOldSchema = {
+    async listTools() { return { tools: [{ name: "get_law_article", inputSchema: oldUpperContract.inputSchema }] }; },
+  };
+  await assert.rejects(
+    () => discoverAndVerifyTools(childWithOldSchema, [newContract], 1000),
+    (error) => error?.code === "DOMAIN_SCHEMA_MISMATCH",
+  );
+});
+
+test("independent workflow expectations detect registry drift", () => {
+  const actual = WORKFLOW_EXPECTATIONS.map((workflow) => structuredClone(workflow));
+  assert.equal(FOCUS_EXPECTATIONS.length, 20);
+  assertWorkflowMatrix(actual);
+
+  const changedId = structuredClone(actual);
+  changedId[0].id = "replacement-workflow";
+  assert.throws(() => assertWorkflowMatrix(changedId), /workflow IDs/);
+
+  const changedCapability = structuredClone(actual);
+  changedCapability[0].capabilities.rule_evaluation = "not_implemented";
+  assert.throws(() => assertWorkflowMatrix(changedCapability), /capabilities drifted/);
+
+  assert.throws(() => assertWorkflowMatrix([...actual, actual[0]]), /must not be duplicated/);
+});
+
+test("practitioner result remaps only root next-action tool names without mutating input", async () => {
+  const source = {
+    schema_version: "practitioner-answer.v1",
+    next_actions: [
+      {
+        action_id: "na.01",
+        target: { law_name: "소득세법", tool: { name: "get_law_article" } },
+        tool: { name: "get_law_article", arguments: {
+          law_name: "소득세법", article: "제70조", lookup_basis: "effective",
+          nested: { tool: { name: "get_law_article" } },
+        } },
+      },
+      { action_id: "na.02", tool: null },
+      { action_id: "na.03", tool: { name: "tax_get_law_article", arguments: { law_name: "소득세법" } } },
+    ],
+    unrelated: { tool: { name: "get_law_article" } },
+  };
+  const original = structuredClone(source);
+  const { server, client } = await connectWithCallToolResult(async () => ({
+    content: [{ type: "text", text: JSON.stringify(source) }],
+    structuredContent: source,
+  }));
+  try {
+    const result = await client.callTool({ name: "tax_answer_practitioner_question", arguments: { matter: {} } });
+    const expected = {
+      ...source,
+      next_actions: [
+        {
+          ...source.next_actions[0],
+          tool: { ...source.next_actions[0].tool, name: "tax_get_law_article" },
+        },
+        source.next_actions[1],
+        source.next_actions[2],
+      ],
+    };
+    assert.deepEqual(result.structuredContent, expected);
+    assert.deepEqual(JSON.parse(result.content[0].text), expected);
+    assert.deepEqual(source, original, "the child result must not be mutated");
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("native invalid-focus practitioner responses preserve their safe envelope", async () => {
+  const structuredContent = {
+    error: "invalid_input",
+    field: "guidance_focus",
+    code: "unsupported_guidance_focus",
+    available_focus_ids: ["expense-review", "closing-reconciliation"],
+  };
+  const content = [
+    { type: "text", text: JSON.stringify(structuredContent), _meta: { block: "validation" } },
+    { type: "text", text: "The requested focus is not supported." },
+  ];
+  const meta = { source: "native-domain" };
+  const nativeResult = { isError: false, content, structuredContent, _meta: meta };
+  const { server, client } = await connectWithCallToolResult(async () => nativeResult);
+  try {
+    const result = await client.callTool({
+      name: "tax_answer_practitioner_question",
+      arguments: { matter: { workflow_id: "corporate-adjustment", facts: { guidance_focus: "unknown" } } },
+    });
+    assert.deepEqual(result.structuredContent, structuredContent);
+    assert.deepEqual(result.content, content);
+    assert.deepEqual(result._meta, meta);
+    assert.equal(result.isError, false);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("native unknown-workflow practitioner validation preserves its safe envelope", async () => {
+  const structuredContent = { error: "invalid_input", field: "matter" };
+  const content = [{ type: "text", text: JSON.stringify(structuredContent), _meta: { block: "validation" } }];
+  const meta = { source: "native-domain" };
+  const nativeResult = { isError: false, content, structuredContent, _meta: meta };
+  const { server, client } = await connectWithCallToolResult(async () => nativeResult);
+  try {
+    const result = await client.callTool({
+      name: "tax_answer_practitioner_question",
+      arguments: { matter: { workflow_id: "p0-unknown-workflow" } },
+    });
+    assert.deepEqual(result.structuredContent, structuredContent);
+    assert.deepEqual(result.content, content);
+    assert.deepEqual(result._meta, meta);
+    assert.equal(result.isError, false);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("recognized credential status practitioner responses preserve their safe envelope", async () => {
+  const structuredContent = { status: "credential_missing", provider: "law_go_kr_oc" };
+  const content = [{ type: "text", text: JSON.stringify(structuredContent), _meta: { block: "status" } }];
+  const meta = { source: "native-domain" };
+  const nativeResult = { isError: false, content, structuredContent, _meta: meta };
+  const { server, client } = await connectWithCallToolResult(async () => nativeResult);
+  try {
+    const result = await client.callTool({ name: "tax_answer_practitioner_question", arguments: { matter: {} } });
+    assert.deepEqual(result.structuredContent, structuredContent);
+    assert.deepEqual(result.content, content);
+    assert.deepEqual(result._meta, meta);
+    assert.equal(result.isError, false);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("unusable practitioner result envelope returns a safe bridge error", async () => {
+  const secret = "PRIVATE_PRACTITIONER_PAYLOAD";
+  const { server, client } = await connectWithCallToolResult(async () => ({
+    content: "not-an-array",
+    structuredContent: {
+      schema_version: "practitioner-answer.v1",
+      next_actions: [],
+      private_note: secret,
+    },
+  }));
+  try {
+    const result = await client.callTool({ name: "tax_answer_practitioner_question", arguments: { matter: {} } });
+    assert.equal(result.isError, true);
+    assert.equal(result.structuredContent?.schema_version, "tax-bridge-error.v1");
+    assert.equal(result.structuredContent?.error_code, "TAX_DOMAIN_ERROR");
+    assert.ok(!JSON.stringify(result).includes(secret));
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("practitioner result with mismatched JSON text is rejected safely", async () => {
+  const secret = "MISMATCHED_PRIVATE_PAYLOAD";
+  const source = { schema_version: "practitioner-answer.v1", next_actions: [], private_note: secret };
+  const { server, client } = await connectWithCallToolResult(async () => ({
+    content: [{ type: "text", text: JSON.stringify({ schema_version: "practitioner-answer.v1", next_actions: [] }) }],
+    structuredContent: source,
+  }));
+  try {
+    const result = await client.callTool({ name: "tax_answer_practitioner_question", arguments: { matter: {} } });
+    assert.equal(result.isError, true);
+    assert.equal(result.structuredContent?.error_code, "TAX_DOMAIN_ERROR");
+    assert.ok(!JSON.stringify(result).includes(secret));
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("practitioner result with malformed content blocks is rejected safely", async () => {
+  const secret = "MALFORMED_BLOCK_SECRET";
+  const source = { schema_version: "practitioner-answer.v1", next_actions: [] };
+  const { server, client } = await connectWithCallToolResult(async () => ({
+    content: [
+      { type: "unknown-block", private_value: secret },
+      { type: "text", text: JSON.stringify(source) },
+    ],
+    structuredContent: source,
+  }));
+  try {
+    const result = await client.callTool({ name: "tax_answer_practitioner_question", arguments: { matter: {} } });
+    assert.equal(result.isError, true);
+    assert.equal(result.structuredContent?.error_code, "TAX_DOMAIN_ERROR");
+    assert.ok(!JSON.stringify(result).includes(secret));
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("practitioner projection keeps mixed blocks and metadata while restoring JSON parity", async () => {
+  const source = {
+    schema_version: "practitioner-answer.v1",
+    next_actions: [{ action_id: "na.01", tool: { name: "get_law_article", arguments: { law_name: "소득세법" } } }],
+  };
+  const projected = {
+    ...source,
+    next_actions: [{ ...source.next_actions[0], tool: { ...source.next_actions[0].tool, name: "tax_get_law_article" } }],
+  };
+  const unrelatedText = JSON.stringify({ explanation: "preserve" });
+  const nonText = { type: "image", data: "aGVsbG8=", mimeType: "image/png", _meta: { block: "image" } };
+  const resultMeta = { origin: "synthetic-test" };
+  const { server, client } = await connectWithCallToolResult(async () => ({
+    content: [
+      { type: "text", text: "Explanatory text stays unchanged." },
+      { type: "text", text: JSON.stringify(source), _meta: { copy: 1 } },
+      nonText,
+      { type: "text", text: unrelatedText },
+      { type: "text", text: JSON.stringify(source, null, 2), _meta: { copy: 2 } },
+    ],
+    structuredContent: source,
+    _meta: resultMeta,
+  }));
+  try {
+    const response = await client.callTool({ name: "tax_answer_practitioner_question", arguments: { matter: {} } });
+    const serialized = JSON.stringify(projected);
+    assert.deepEqual(response.structuredContent, projected);
+    assert.deepEqual(response.content, [
+      { type: "text", text: "Explanatory text stays unchanged." },
+      { type: "text", text: serialized, _meta: { copy: 1 } },
+      nonText,
+      { type: "text", text: unrelatedText },
+      { type: "text", text: serialized, _meta: { copy: 2 } },
+    ]);
+    assert.deepEqual(response._meta, resultMeta);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
 test("error mapping never leaks stderr or paths", async () => {
   const secret = "/secret/leak/path SECRET_STDERR";
   const missing = new TaxDomainClient({ command: "/nonexistent/" + "bin-xyz", args: [] });
@@ -415,6 +718,7 @@ const server = new McpServer({ name: "sentinel-tax-error", version: "0" });
 server.tool("get_law_article", "", {
   law_name: z.string().min(1).max(100), article: z.string().min(1).max(20),
   law_id: z.string().max(10).nullable().optional(),
+  lookup_basis: z.enum(["promulgation", "effective"]).optional(),
 }, async () => ({ isError: true, content: [{ type: "text", text: ${JSON.stringify(sentinel)} }] }));
 await server.connect(new StdioServerTransport());
 `;
@@ -429,6 +733,58 @@ await server.connect(new StdioServerTransport());
     assert.ok(!JSON.stringify(result).includes("OC="));
   } finally {
     await bridge.close();
+  }
+});
+
+test("unknown or malformed practitioner action tools are rejected without payload leakage", async () => {
+  const secret = "SYNTHETIC_PRIVATE_ACTION_MARKER";
+  const invalidActions = [
+    [{ action_id: "unknown", tool: { name: "unregistered_private_tool", arguments: { secret } } }],
+    [{ action_id: "missing-arguments", tool: { name: "get_law_article" } }],
+    [{ action_id: "bad-tool", tool: "get_law_article" }],
+    [{ action_id: "missing-tool" }],
+  ];
+  for (const next_actions of invalidActions) {
+    const source = { schema_version: "practitioner-answer.v1", next_actions, secret };
+    const { server, client } = await connectWithCallToolResult(async () => ({
+      content: [{ type: "text", text: JSON.stringify(source) }],
+      structuredContent: source,
+    }));
+    try {
+      const result = await client.callTool({ name: "tax_answer_practitioner_question", arguments: { matter: {} } });
+      assert.equal(result.isError, true);
+      assert.equal(result.structuredContent?.error_code, "TAX_DOMAIN_ERROR");
+      assert.ok(!JSON.stringify(result).includes(secret));
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  }
+});
+
+test("practitioner bridge errors pass through without answer projection", async () => {
+  const error = {
+    schema_version: "tax-bridge-error.v1",
+    error_code: "TAX_DOMAIN_TOOL_ERROR",
+    message: "Tax domain tool reported an error.",
+  };
+  const errorText = JSON.stringify(error);
+  const meta = { correlation: "safe" };
+  const { server, client } = await connectWithCallToolResult(async () => ({
+    isError: true,
+    content: [{ type: "text", text: errorText }],
+    structuredContent: error,
+    _meta: meta,
+  }));
+  try {
+    const result = await client.callTool({ name: "tax_answer_practitioner_question", arguments: { matter: {} } });
+    assert.equal(result.isError, true);
+    assert.deepEqual(result.structuredContent, error);
+    assert.equal(result.content[0].text, errorText);
+    assert.deepEqual(result._meta, meta);
+  } finally {
+    await client.close();
+    await server.close();
   }
 });
 
