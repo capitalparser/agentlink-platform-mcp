@@ -157,6 +157,14 @@ export function registerTaxDomainTools(server: McpServer, client: TaxDomainClien
     contracts.push({ publicName: name, domainName: domainTool, inputSchema: toJsonSchemaCompat(z.object(shape), { pipeStrategy: "input" }) });
   };
 
+  reg("tax_route_question", "route_tax_question",
+    "Find possible tax workflows from a question using a closed keyword registry. Candidates require user confirmation; this is not legal or semantic classification (질문에서 키워드 기준 세무 업무 후보를 찾습니다. 후보는 사용자가 확인해야 하며 법률·의미 분류가 아닙니다).",
+    { question: z.string().max(500).describe("Tax preparation question, at most 500 characters (세무 준비 질문, 최대 500자)") });
+
+  reg("tax_health", "health",
+    "Show tax-domain health and credential-presence booleans only. Credential presence does not prove authorization or successful provider access (세무 도메인 상태와 자격증명 존재 여부만 표시합니다. 자격증명 존재가 인증·제공처 조회 성공을 뜻하지 않습니다).",
+    {});
+
   reg("tax_list_workflows", "list_tax_workflows",
     "List the tax sub-workflows and their implementation status (세무 하위 업무와 구현 상태 목록).", {});
 

@@ -21,13 +21,26 @@ async function main(): Promise<void> {
 
   // Graceful shutdown: close server (and tax child) with a bounded wait.
   // StdioServerTransport does not fire onclose on stdin EOF, so listen explicitly.
-  let shuttingDown = false;
-  const shutdown = async (code: number): Promise<void> => {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    const timer = new Promise<void>((resolve) => setTimeout(resolve, 2000));
-    await Promise.race([server.close().catch(() => {}), timer]);
-    process.exit(code);
+  let shutdownPromise: Promise<void> | undefined;
+  const shutdown = (code: number): Promise<void> => {
+    if (!shutdownPromise) {
+      shutdownPromise = (async () => {
+        let fallbackTimer: NodeJS.Timeout | undefined;
+        const fallback = new Promise<void>((resolve) => {
+          fallbackTimer = setTimeout(resolve, 6000);
+          fallbackTimer.unref();
+        });
+        try {
+          await Promise.race([server.close(), fallback]);
+        } catch {
+          // Cleanup is best-effort; do not print paths or child errors at shutdown.
+        } finally {
+          if (fallbackTimer) clearTimeout(fallbackTimer);
+          process.exit(code);
+        }
+      })();
+    }
+    return shutdownPromise;
   };
 
   process.stdin.on("end", () => void shutdown(0));

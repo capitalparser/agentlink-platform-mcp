@@ -16,7 +16,7 @@ import { memoryDomainClient, genericContracts } from "./fixtures/memory-domain-c
 import { assertWorkflowMatrix, FOCUS_EXPECTATIONS, WORKFLOW_EXPECTATIONS } from "./fixtures/review-expectations.mjs";
 
 const TAX_TOOLS = [
-  "tax_list_workflows", "tax_get_workflow_contract", "tax_plan_work", "tax_get_automation_offer",
+  "tax_list_workflows", "tax_route_question", "tax_health", "tax_get_workflow_contract", "tax_plan_work", "tax_get_automation_offer",
   "tax_list_rule_cards", "tax_search_law", "tax_get_law_article", "tax_check_business_status",
   "tax_list_practice_cards", "tax_list_holidays", "tax_get_schedule",
   "tax_find_office", "tax_search_interpretations", "tax_get_tribunal_decision",
@@ -42,7 +42,7 @@ async function connectWithCallToolResult(callToolResult) {
   return { server, client };
 }
 
-test("tool list has 19 read-only tax tools; signed calculation content passes through unchanged", async () => {
+test("tool list has 21 read-only tax tools; signed calculation content passes through unchanged", async () => {
   const automation_offer = {
     schema_version: "automation-offer.v1",
     label: "automation_offer_not_legal_content",
@@ -72,7 +72,7 @@ test("tool list has 19 read-only tax tools; signed calculation content passes th
   };
   const { client } = await connect(fake);
   const { tools } = await client.listTools();
-  assert.equal(tools.filter((t) => t.name.startsWith("tax_")).length, 19);
+  assert.equal(tools.filter((t) => t.name.startsWith("tax_")).length, 21);
   for (const n of TAX_TOOLS) {
     const t = tools.find((x) => x.name === n);
     assert.ok(t, `missing ${n}`);
@@ -80,6 +80,10 @@ test("tool list has 19 read-only tax tools; signed calculation content passes th
   }
   assert.ok(tools.find((x) => x.name === "agentlink_bridge_status"), "diagnostic tool is available");
   assert.ok(tools.find((x) => x.name === "get_vat_data"), "explicit demo tools are available in this test");
+  const routeSchema = tools.find((tool) => tool.name === "tax_route_question")?.inputSchema;
+  assert.deepEqual(routeSchema?.required, ["question"]);
+  assert.equal(routeSchema?.properties?.question?.maxLength, 500);
+  assert.deepEqual(tools.find((tool) => tool.name === "tax_health")?.inputSchema?.properties, {});
   const res = await client.callTool({ name: "tax_plan_work", arguments: { matter: { matter_id: "m", extra: 1 } } });
   assert.deepEqual(res.structuredContent, payload);
   assert.deepEqual(res.structuredContent.automation_offer, automation_offer);
@@ -89,6 +93,10 @@ test("tool list has 19 read-only tax tools; signed calculation content passes th
   assert.deepEqual(calls[1], ["search_tax_law", { query: "원천징수", target: "law", limit: 10 }]);
   await client.callTool({ name: "tax_get_law_article", arguments: { law_name: "소득세법", article: "제128조", law_id: "001565" } });
   assert.deepEqual(calls[2], ["get_law_article", { law_name: "소득세법", article: "제128조", law_id: "001565" }]);
+  await client.callTool({ name: "tax_route_question", arguments: { question: "부가세 매입 자료 검토" } });
+  assert.deepEqual(calls[3], ["route_tax_question", { question: "부가세 매입 자료 검토" }]);
+  await client.callTool({ name: "tax_health", arguments: {} });
+  assert.deepEqual(calls[4], ["health", {}]);
   for (const name of ["tax_answer_practitioner_question", "tax_export_rule_cards"]) {
     const args = name === "tax_answer_practitioner_question" ? { matter: {} } : {};
     const result = await client.callTool({ name, arguments: args });
@@ -420,6 +428,25 @@ test("lookup basis schema compatibility accepts old upper with new child but rej
   await assert.rejects(
     () => discoverAndVerifyTools(childWithOldSchema, [newContract], 1000),
     (error) => error?.code === "DOMAIN_SCHEMA_MISMATCH",
+  );
+});
+
+test("new route and health tools are required child contracts", async () => {
+  const schemaSource = new McpServer({ name: "tax-contract-source", version: "0" });
+  const contracts = registerTaxDomainTools(schemaSource, {
+    setStatusListener() {},
+    async callToolResult() { return { content: [{ type: "text", text: "{}" }], structuredContent: {} }; },
+  }).contracts;
+  const newContracts = contracts.filter((item) => ["route_tax_question", "health"].includes(item.domainName));
+  assert.equal(newContracts.length, 2);
+  const oldChild = {
+    async listTools() {
+      return { tools: contracts.filter((item) => !newContracts.includes(item)).map(({ domainName, inputSchema }) => ({ name: domainName, inputSchema })) };
+    },
+  };
+  await assert.rejects(
+    () => discoverAndVerifyTools(oldChild, contracts, 1000),
+    (error) => error?.code === "DOMAIN_TOOL_MISSING",
   );
 });
 

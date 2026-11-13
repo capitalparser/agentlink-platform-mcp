@@ -158,8 +158,11 @@ test("installed tax child matches the native and upper review matrix over MCP st
     const nativeNames = nativeTools.map((tool) => tool.name);
     const taxNames = names.filter((name) => name.startsWith("tax_"));
     const bridgeStatus = await call("agentlink_bridge_status");
-    assert.equal(taxNames.length, 19,
+    assert.equal(taxNames.length, 21,
       `all mapped tax tools should be exposed after real child discovery; status=${JSON.stringify(bridgeStatus)}; tools=${names.join(",")}`);
+    for (const name of ["tax_route_question", "tax_health"]) {
+      assert.ok(names.includes(name), `missing required ${name}`);
+    }
     const lawArticleTool = tools.find((tool) => tool.name === "tax_get_law_article");
     assert.ok(lawArticleTool, "the public law article tool should be advertised");
     assert.deepEqual(lawArticleTool.inputSchema.properties.lookup_basis.enum, ["promulgation", "effective"]);
@@ -170,10 +173,10 @@ test("installed tax child matches the native and upper review matrix over MCP st
     assert.deepEqual(nativeLawArticleTool.inputSchema.properties.lookup_basis.enum, ["promulgation", "effective"]);
     assert.ok(!nativeLawArticleTool.inputSchema.required?.includes("lookup_basis"),
       "lookup_basis remains optional in the native contract");
-    for (const name of ["tax_list_workflows", "tax_get_workflow_contract", "tax_plan_work"]) {
+    for (const name of ["tax_list_workflows", "tax_get_workflow_contract", "tax_plan_work", "tax_route_question", "tax_health"]) {
       assert.ok(names.includes(name), `missing ${name}`);
     }
-    for (const name of ["list_tax_workflows", "get_workflow_contract", "plan_tax_work",
+    for (const name of ["list_tax_workflows", "get_workflow_contract", "plan_tax_work", "route_tax_question", "health",
       "answer_practitioner_question", "get_law_article"]) {
       assert.ok(nativeNames.includes(name), `native tools/list is missing ${name}`);
     }
@@ -189,6 +192,18 @@ test("installed tax child matches the native and upper review matrix over MCP st
       call("tax_list_workflows"),
       callNative("list_tax_workflows"),
     ]);
+    const [health, nativeHealth] = await Promise.all([call("tax_health"), callNative("health")]);
+    assert.deepEqual(health, nativeHealth, "upper health should preserve native health fields");
+    assert.equal(health.status, "ok");
+    assert.ok(Number.isInteger(health.workflows));
+    const question = "부가세 매입 세금계산서 검토";
+    const [route, nativeRoute] = await Promise.all([
+      call("tax_route_question", { question }),
+      callNative("route_tax_question", { question }),
+    ]);
+    assert.deepEqual(route, nativeRoute, "upper question routing should preserve the native result");
+    assert.equal(route.status, "matched");
+    assert.equal(route.candidates[0]?.workflow_id, "vat-return");
     assert.equal(workflowList.domain, "tax");
     assertWorkflowMatrix(workflowList.workflows);
     assertWorkflowMatrix(nativeWorkflowList.workflows);

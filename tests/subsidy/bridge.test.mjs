@@ -22,7 +22,7 @@ const BASELINE = [
   'tax_check_business_status', 'tax_export_rule_cards', 'tax_find_office', 'tax_get_automation_offer',
   'tax_get_form_field_tips', 'tax_get_law_article', 'tax_get_schedule', 'tax_get_tribunal_decision', 'tax_get_workflow_contract',
   'tax_list_form_guides', 'tax_list_holidays', 'tax_list_practice_cards', 'tax_list_rule_cards', 'tax_list_workflows',
-  'tax_plan_work', 'tax_search_forms', 'tax_search_interpretations', 'tax_search_law', 'verify_business_registration',
+  'tax_plan_work', 'tax_route_question', 'tax_health', 'tax_search_forms', 'tax_search_interpretations', 'tax_search_law', 'verify_business_registration',
 ];
 const schemaSource = new McpServer({ name: 'subsidy-contract-source', version: '0' });
 const DOMAIN_CONTRACTS = registerSubsidyDomainTools(schemaSource, memoryDomainClient()).contracts;
@@ -58,7 +58,7 @@ test('T1: exact tax and subsidy tools, notices, annotations and stdio structured
   const client = await connect(t, subsidy);
   const { tools } = await client.listTools();
   assert.deepEqual(tools.map(x => x.name).sort(), [...BASELINE, ...SUBSIDY.map(x => `subsidy_${x}`)].sort());
-  assert.equal(tools.filter(x => x.name.startsWith('tax_')).length, 19);
+  assert.equal(tools.filter(x => x.name.startsWith('tax_')).length, 21);
   for (const name of SUBSIDY) {
     const tool = tools.find(x => x.name === `subsidy_${name}`);
     assert.deepEqual(tool.annotations, { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false });

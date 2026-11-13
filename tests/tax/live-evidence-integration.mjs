@@ -1362,7 +1362,9 @@ test("installed wheel returns current law and opted-in withholding evidence thro
     await withUpper(scratch, undefined, async (_client, call) => {
       const listed = await _client.listTools();
       const names = listed.tools.map((tool) => tool.name);
-      same(names.filter((name) => name.startsWith("tax_")).length, 19, "Upper MCP must expose 19 verified tax tools");
+      same(names.filter((name) => name.startsWith("tax_")).length, 21, "Upper MCP must expose all 21 verified tax tools");
+      must(names.includes("tax_route_question") && names.includes("tax_health"),
+        "Upper MCP must expose the required route and health tools");
       must(names.includes("tax_get_law_article"), "Upper MCP must expose the native law-article tool");
 
       const search = await call("tax_search_law", { query: "소득세법", target: "law", limit: 10 });

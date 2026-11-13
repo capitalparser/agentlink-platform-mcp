@@ -6,7 +6,8 @@
   "author": "AgentLink Korea",
   "type": "module",
   "bin": {
-    "agentlink-mcp-server": "dist/index.js"
+    "agentlink-mcp-server": "dist/index.js",
+    "agentlink-tax-doctor": "dist/tax-doctor.js"
   },
   "main": "dist/index.js",
   "files": [

@@ -77,8 +77,32 @@ export async function createServer(options: CreateServerOptions = {}): Promise<M
 
   const prevOnClose = server.server.onclose;
   server.server.onclose = () => {
-    void Promise.all([taxClient.close(), ...(subsidyClient ? [subsidyClient.close()] : [])]);
+    void closeDomainClients();
     prevOnClose?.();
   };
+
+  let domainClosePromise: Promise<void> | undefined;
+  const closeDomainClients = (): Promise<void> => {
+    if (!domainClosePromise) {
+      domainClosePromise = Promise.allSettled([
+        Promise.resolve().then(() => taxClient.close()),
+        ...(subsidyClient ? [Promise.resolve().then(() => subsidyClient.close())] : []),
+      ]).then(() => undefined);
+    }
+    return domainClosePromise;
+  };
+
+  const originalClose = server.close.bind(server);
+  let serverClosePromise: Promise<void> | undefined;
+  server.close = (): Promise<void> => {
+    if (!serverClosePromise) {
+      serverClosePromise = Promise.allSettled([
+        Promise.resolve().then(() => originalClose()),
+        closeDomainClients(),
+      ]).then(() => undefined);
+    }
+    return serverClosePromise;
+  };
+
   return server;
 }

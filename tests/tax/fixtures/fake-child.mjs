@@ -5,7 +5,9 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import { registerTaxDomainTools } from '../../../dist/domains/tax/tools.js';
 
-if (process.argv[2]) appendFileSync(process.argv[2], `${process.pid}\n`);
+if (process.argv[2]) appendFileSync(process.argv[2], `${process.pid} ${process.ppid}\n`);
+if (process.argv[3] === 'stderr-secret') process.stderr.write('CHILD_STDERR_SECRET_SENTINEL /private/fixture/path\n');
+if (process.argv[3] === 'health-timeout') process.on('SIGTERM', () => {});
 
 const schemaServer = new McpServer({ name: 'tax-schema-source', version: '0' });
 const registered = registerTaxDomainTools(schemaServer, {
@@ -20,7 +22,21 @@ const server = new McpServer({ name: 'fake-tax', version: '0' });
 const ok = (structuredContent) => ({ content: [{ type: 'text', text: JSON.stringify(structuredContent) }], structuredContent });
 for (let index = 0; index < registered.contracts.length; index++) {
   const { domainName } = registered.contracts[index];
-  server.registerTool(domainName, { inputSchema: registered.handles[index].inputSchema }, async (args) => ok({ name: domainName, args }));
+  server.registerTool(domainName, { inputSchema: registered.handles[index].inputSchema }, async (args) => {
+    if (domainName === 'health') {
+      if (process.argv[3] === 'health-timeout') await new Promise((resolve) => setTimeout(resolve, 15_000));
+      return ok({ status: 'ok', version: 'fixture-1', workflows: 3, credentials: { law_go_kr_oc: false } });
+    }
+    if (domainName === 'list_tax_workflows') {
+      return ok({ domain: 'tax', workflows: [
+        { id: 'withholding-payment' }, { id: 'vat-return' }, { id: 'corporate-adjustment' },
+      ] });
+    }
+    if (domainName === 'route_tax_question') {
+      return ok({ schema_version: 'tax-question-route.v1', status: 'unmatched', requires_confirmation: true, candidates: [] });
+    }
+    return ok({ name: domainName, args });
+  });
 }
 server.tool('ping', 'ping', {}, async () => ok({ pid: process.pid }));
 server.tool('crash', 'crash', {}, async () => { process.exit(1); });
