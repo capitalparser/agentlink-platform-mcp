@@ -1,0 +1,89 @@
+name: package-checks
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Record the runtime versions
+        run: |
+          node --version
+          npm --version
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run package tests
+        run: npm test
+
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=low
+
+      - name: Record the resolved dependency tree
+        run: npm ls --omit=dev --all --json
+
+      - name: Pack the distributable
+        run: |
+          mkdir -p "$RUNNER_TEMP/upper-package"
+          npm pack --pack-destination "$RUNNER_TEMP/upper-package"
+          shopt -s nullglob
+          packages=("$RUNNER_TEMP/upper-package"/*.tgz)
+          test "${#packages[@]}" -eq 1
+          printf '%s\n' "${packages[0]}" > "$RUNNER_TEMP/upper-package.path"
+
+      - name: Install and inspect the packaged commands
+        env:
+          UPPER_RUNTIME: ${{ runner.temp }}/upper-runtime
+        run: |
+          package="$(cat "$RUNNER_TEMP/upper-package.path")"
+          mkdir -p "$UPPER_RUNTIME"
+          npm install --prefix "$UPPER_RUNTIME" --omit=dev --no-audit --no-fund "$package"
+          UPPER_PACKAGE_ROOT="$UPPER_RUNTIME/node_modules/agentlink-mcp-server" \
+          UPPER_RUNTIME="$UPPER_RUNTIME" node --input-type=module <<'NODE'
+          import { existsSync, readFileSync } from "node:fs";
+          import { join } from "node:path";
+
+          const root = process.env.UPPER_PACKAGE_ROOT;
+          const runtime = process.env.UPPER_RUNTIME;
+          const manifest = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
+          const expectedBins = {
+            "agentlink-mcp-server": "dist/index.js",
+            "agentlink-tax-doctor": "dist/tax-doctor.js",
+          };
+          if (manifest.main !== expectedBins["agentlink-mcp-server"]) {
+            throw new Error(`unexpected package main: ${manifest.main}`);
+          }
+          for (const [name, file] of Object.entries(expectedBins)) {
+            if (manifest.bin?.[name] !== file || !existsSync(join(root, file))) {
+              throw new Error(`missing packaged command ${name}: ${file}`);
+            }
+            if (!existsSync(join(runtime, "node_modules", ".bin", name))) {
+              throw new Error(`missing installed bin link ${name}`);
+            }
+          }
+          console.log(JSON.stringify({ main: manifest.main, bin: manifest.bin }));
+          NODE

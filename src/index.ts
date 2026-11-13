@@ -15,14 +15,21 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { createServer } from "./server.js";
 
 async function main(): Promise<void> {
-  const server = await createServer();
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+  type OwnedServer = Awaited<ReturnType<typeof createServer>>;
+  let server: OwnedServer | undefined;
+  let stopping = false;
+  let ownershipSettled = false;
+  let resolveOwnership!: (created: OwnedServer | undefined) => void;
+  const ownership = new Promise<OwnedServer | undefined>((resolve) => { resolveOwnership = resolve; });
+  const settleOwnership = (created: OwnedServer | undefined) => {
+    if (ownershipSettled) return;
+    ownershipSettled = true;
+    resolveOwnership(created);
+  };
 
-  // Graceful shutdown: close server (and tax child) with a bounded wait.
-  // StdioServerTransport does not fire onclose on stdin EOF, so listen explicitly.
   let shutdownPromise: Promise<void> | undefined;
   const shutdown = (code: number): Promise<void> => {
+    stopping = true;
     if (!shutdownPromise) {
       shutdownPromise = (async () => {
         let fallbackTimer: NodeJS.Timeout | undefined;
@@ -31,7 +38,11 @@ async function main(): Promise<void> {
           fallbackTimer.unref();
         });
         try {
-          await Promise.race([server.close(), fallback]);
+          const closing = (async () => {
+            const owned = server ?? (ownershipSettled ? undefined : await ownership);
+            await owned?.close();
+          })();
+          await Promise.race([closing, fallback]);
         } catch {
           // Cleanup is best-effort; do not print paths or child errors at shutdown.
         } finally {
@@ -43,13 +54,33 @@ async function main(): Promise<void> {
     return shutdownPromise;
   };
 
+  // Install lifecycle listeners before discovery starts. In particular, stdin
+  // must remain buffered so the MCP transport can consume initialization bytes.
   process.stdin.on("end", () => void shutdown(0));
   process.stdin.on("close", () => void shutdown(0));
   process.on("SIGINT", () => void shutdown(0));
   process.on("SIGTERM", () => void shutdown(0));
+
+  try {
+    server = await createServer({
+      onServerCreated(created) {
+        server = created;
+        settleOwnership(created);
+        if (stopping) void created.close();
+      },
+    });
+    settleOwnership(server);
+    if (stopping) {
+      await shutdownPromise;
+      return;
+    }
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+  } catch {
+    settleOwnership(server);
+    if (!stopping) console.error("Failed to start AgentLink MCP server.");
+    await shutdown(stopping ? 0 : 1);
+  }
 }
 
-main().catch(() => {
-  console.error("Failed to start AgentLink MCP server.");
-  process.exit(1);
-});
+void main();

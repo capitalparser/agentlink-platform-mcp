@@ -8,6 +8,11 @@ import { registerTaxDomainTools } from '../../../dist/domains/tax/tools.js';
 if (process.argv[2]) appendFileSync(process.argv[2], `${process.pid} ${process.ppid}\n`);
 if (process.argv[3] === 'stderr-secret') process.stderr.write('CHILD_STDERR_SECRET_SENTINEL /private/fixture/path\n');
 if (process.argv[3] === 'health-timeout') process.on('SIGTERM', () => {});
+if (process.argv[3] === 'initialization-hang' || process.argv[3] === 'initialization-hang-ignore-sigterm') {
+  if (process.argv[3] === 'initialization-hang-ignore-sigterm') process.on('SIGTERM', () => {});
+  process.stdin.resume();
+  setInterval(() => {}, 1000);
+} else {
 
 const schemaServer = new McpServer({ name: 'tax-schema-source', version: '0' });
 const registered = registerTaxDomainTools(schemaServer, {
@@ -54,3 +59,4 @@ server.tool('fail', 'fail', {}, async () => ({
   content: [{ type: 'text', text: 'RAW_DOMAIN_SECRET /private/path' }],
 }));
 await server.connect(new StdioServerTransport());
+}

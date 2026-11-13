@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { createServer } from '../../dist/server.js';
@@ -19,7 +20,7 @@ const BASELINE = [
   'agentlink_bridge_status',
   'get_business_info', 'get_disaster_alerts', 'get_income_tax_summary', 'get_procurement_data', 'get_tax_invoice',
   'get_vat_data', 'search_court_precedents', 'search_public_notices', 'tax_answer_practitioner_question',
-  'tax_check_business_status', 'tax_export_rule_cards', 'tax_find_office', 'tax_get_automation_offer',
+  'tax_check_business_status', 'tax_create_draft_bundle', 'tax_export_rule_cards', 'tax_find_office', 'tax_get_automation_offer',
   'tax_get_form_field_tips', 'tax_get_law_article', 'tax_get_schedule', 'tax_get_tribunal_decision', 'tax_get_workflow_contract',
   'tax_list_form_guides', 'tax_list_holidays', 'tax_list_practice_cards', 'tax_list_rule_cards', 'tax_list_workflows',
   'tax_plan_work', 'tax_route_question', 'tax_health', 'tax_search_forms', 'tax_search_interpretations', 'tax_search_law', 'verify_business_registration',
@@ -58,7 +59,7 @@ test('T1: exact tax and subsidy tools, notices, annotations and stdio structured
   const client = await connect(t, subsidy);
   const { tools } = await client.listTools();
   assert.deepEqual(tools.map(x => x.name).sort(), [...BASELINE, ...SUBSIDY.map(x => `subsidy_${x}`)].sort());
-  assert.equal(tools.filter(x => x.name.startsWith('tax_')).length, 21);
+  assert.equal(tools.filter(x => x.name.startsWith('tax_')).length, 22);
   for (const name of SUBSIDY) {
     const tool = tools.find(x => x.name === `subsidy_${name}`);
     assert.deepEqual(tool.annotations, { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false });
@@ -66,6 +67,10 @@ test('T1: exact tax and subsidy tools, notices, annotations and stdio structured
     assert.match(tool.description, /public_url/);
     assert.equal(tool.inputSchema.additionalProperties, false);
   }
+  const referenceBundleSchema = tools.find(x => x.name === 'subsidy_get_reference_bundle').inputSchema;
+  assert.equal(referenceBundleSchema.properties.limit.default, 8);
+  assert.equal(referenceBundleSchema.properties.context.additionalProperties, false,
+    'subsidy context must reject unknown fields');
   const practitionerDescription = tools.find(x => x.name === 'subsidy_answer_practitioner_question').description;
   for (const marker of ['action.action_id', 'followed_action_id', '$conversation_state', '$answer', '직전 응답', '사용자 답변']) assert.ok(practitionerDescription.includes(marker));
   // Funding MCP PR #2 integration: re-read its registry, then update this exact full list and count.
@@ -99,6 +104,56 @@ test('P3-1 Unicode guard rejects malformed surrogate text and preserves valid Un
   const validEnvelope = { query: '😀\u0000', context: { facts: { ['키😀\u0000']: 'عربي\u0000' } }, matter: { ['مفتاح😀\u0000']: '한글😀\u0000' } };
   assert.notEqual((await call(client, 'get_reference_bundle', validEnvelope)).isError, true);
   assert.deepEqual(calls.at(-1)[1], { ...validEnvelope, limit: 8 });
+});
+
+test('P3-2 rejects own enumerable __proto__ keys before parsing all subsidy record boundaries', async t => {
+  const calls = [];
+  const client = await connect(t, { async callTool(name, args) { calls.push([name, args]); return {}; }, async close() {} });
+  const marker = 'PROTO_VALUE_MUST_NOT_LEAK';
+  const ownProtoRecord = value => {
+    const record = JSON.parse('{"safe":"retained"}');
+    Object.defineProperty(record, '__proto__', { enumerable: true, configurable: true, value });
+    return record;
+  };
+  const malformedObject = { secret: marker, malformed: '\ud800' };
+  const malformedString = `${marker}\ud800`;
+  const rejectedCases = [
+    ['matter benign', 'get_reference_bundle', { query: 'x', context: {}, matter: ownProtoRecord(marker) }],
+    ['matter malformed', 'get_reference_bundle', { query: 'x', context: {}, matter: ownProtoRecord(malformedObject) }],
+    ['conversation_state benign', 'answer_practitioner_question', { question: 'x', conversation_state: ownProtoRecord(marker) }],
+    ['conversation_state malformed', 'answer_practitioner_question', { question: 'x', conversation_state: ownProtoRecord(malformedObject) }],
+    ['context facts benign', 'get_reference_bundle', { query: 'x', context: { facts: ownProtoRecord(marker) } }],
+    ['context facts malformed', 'get_reference_bundle', { query: 'x', context: { facts: ownProtoRecord(malformedString) } }],
+    ['practitioner facts benign', 'answer_practitioner_question', { question: 'x', facts: ownProtoRecord(marker) }],
+    ['practitioner facts malformed', 'answer_practitioner_question', { question: 'x', facts: ownProtoRecord(malformedString) }],
+  ];
+  for (const [label, name, args] of rejectedCases) {
+    let diagnostic;
+    try {
+      const result = await call(client, name, args);
+      assert.equal(result.isError, true, `${label} must be rejected`);
+      diagnostic = JSON.stringify(result);
+    } catch (error) {
+      diagnostic = String(error);
+    }
+    assert.ok(!diagnostic.includes(marker), `${label} error must not echo the attacker value`);
+  }
+  assert.equal(calls.length, 0, 'rejected arguments must not reach the child');
+
+  const validBundle = {
+    query: 'x',
+    context: { facts: { constructor: 'zero', prototype: 'null', '鍵': '値' } },
+    matter: { constructor: 0, prototype: null, nested: { constructor: [0, null], prototype: 'retained' }, 'ключ': 'значение' },
+  };
+  const validAnswer = {
+    question: 'x',
+    facts: { constructor: 'zero', prototype: 'null', safe_name: 'retained' },
+    conversation_state: { constructor: 0, prototype: null, nested: { constructor: 0, prototype: [0, null, '✓'] }, '鍵': '値' },
+  };
+  assert.notEqual((await call(client, 'get_reference_bundle', validBundle)).isError, true);
+  assert.notEqual((await call(client, 'answer_practitioner_question', validAnswer)).isError, true);
+  assert.deepEqual(calls[0], ['get_reference_bundle', { ...validBundle, limit: 8 }]);
+  assert.deepEqual(calls[1], ['answer_practitioner_question', validAnswer]);
 });
 
 test('P3-1 depth guard accepts depth 20 and rejects depth 21 for state and matter', async t => {
@@ -292,4 +347,34 @@ test('T5: structural domain errors and topic result wrappers pass unchanged with
   }
   const client = await connect(t, { async callTool() { return { schema_version: 'subsidy-bridge-error.v1', error_code: 'SUBSIDY_DOMAIN_ERROR', message: 'Subsidy domain call failed.' }; }, async close() {} });
   assert.equal((await call(client, 'list_workflows')).isError, true);
+});
+
+test('SDK eager close and subsidy shutdown share one awaited transport close', { timeout: 10_000 }, async () => {
+  const originalClose = StdioClientTransport.prototype.close;
+  let closeCalls = 0;
+  let releaseGate;
+  const gate = new Promise(resolve => { releaseGate = resolve; });
+  StdioClientTransport.prototype.close = function (...args) {
+    closeCalls++;
+    return gate.then(() => originalClose.apply(this, args));
+  };
+  const domain = new SubsidyDomainClient({ command: 'missing-subsidy-child-command', args: [], timeoutMs: 1_000 }, { PATH: process.env.PATH });
+  let initializing;
+  let closing;
+  try {
+    initializing = domain.initialize(FAKE_CONTRACTS);
+    const deadline = Date.now() + 3_000;
+    while (closeCalls === 0 && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(closeCalls, 1, 'the SDK eager close enters the owned transport close once');
+
+    let closeSettled = false;
+    closing = domain.close().then(() => { closeSettled = true; });
+    await new Promise(resolve => setTimeout(resolve, 30));
+    assert.equal(closeCalls, 1, 'subsidy shutdown reuses the eager transport close');
+    assert.equal(closeSettled, false, 'subsidy shutdown waits for that close to finish');
+  } finally {
+    StdioClientTransport.prototype.close = originalClose;
+    releaseGate();
+    await Promise.allSettled([initializing, closing].filter(Boolean));
+  }
 });

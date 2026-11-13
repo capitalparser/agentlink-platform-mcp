@@ -23,13 +23,15 @@ export interface CreateServerOptions {
   demo?: boolean;
   taxDomainClient?: TaxDomainClientLike;
   subsidyDomainClient?: SubsidyDomainClientLike;
+  /** Receives cleanup ownership before configured domain discovery begins. */
+  onServerCreated?: (server: McpServer) => void;
 }
 
 function emptySubsidyStatus(): SubsidyDomainStatus {
   return { configured: false, state: "not_configured", verified_tool_names: [], verified_tool_count: 0 };
 }
 
-/** Build the server only after each configured domain has completed discovery. */
+/** Build the server and expose cleanup ownership before configured domain discovery. */
 export async function createServer(options: CreateServerOptions = {}): Promise<McpServer> {
   const server = new McpServer({ name: "agentlink-korea", version: "0.1.0" });
   const demo = options.demo === true || process.env.AGENTLINK_DEMO_TOOLS === "1";
@@ -66,23 +68,11 @@ export async function createServer(options: CreateServerOptions = {}): Promise<M
       return { content: [{ type: "text" as const, text: JSON.stringify(status) }], structuredContent: status };
     });
 
-  await Promise.all([
-    taxClient.initialize(taxTools.contracts).catch(() => ({
-      configured: true, state: "unavailable", error_code: "TAX_DOMAIN_UNAVAILABLE", verified_tool_names: [], verified_tool_count: 0,
-    } satisfies DomainStatus)),
-    ...(subsidyClient && subsidyTools ? [subsidyClient.initialize(subsidyTools.contracts).catch(() => ({
-      configured: true, state: "unavailable", error_code: "SUBSIDY_DOMAIN_UNAVAILABLE", verified_tool_names: [], verified_tool_count: 0,
-    } satisfies SubsidyDomainStatus))] : []),
-  ]);
-
   const prevOnClose = server.server.onclose;
-  server.server.onclose = () => {
-    void closeDomainClients();
-    prevOnClose?.();
-  };
-
+  let closing = false;
   let domainClosePromise: Promise<void> | undefined;
   const closeDomainClients = (): Promise<void> => {
+    closing = true;
     if (!domainClosePromise) {
       domainClosePromise = Promise.allSettled([
         Promise.resolve().then(() => taxClient.close()),
@@ -92,9 +82,15 @@ export async function createServer(options: CreateServerOptions = {}): Promise<M
     return domainClosePromise;
   };
 
+  server.server.onclose = () => {
+    void closeDomainClients();
+    prevOnClose?.();
+  };
+
   const originalClose = server.close.bind(server);
   let serverClosePromise: Promise<void> | undefined;
   server.close = (): Promise<void> => {
+    closing = true;
     if (!serverClosePromise) {
       serverClosePromise = Promise.allSettled([
         Promise.resolve().then(() => originalClose()),
@@ -104,5 +100,22 @@ export async function createServer(options: CreateServerOptions = {}): Promise<M
     return serverClosePromise;
   };
 
-  return server;
+  try {
+    options.onServerCreated?.(server);
+    if (closing) return server;
+
+    await Promise.all([
+      taxClient.initialize(taxTools.contracts).catch(() => ({
+        configured: true, state: "unavailable", error_code: "TAX_DOMAIN_UNAVAILABLE", verified_tool_names: [], verified_tool_count: 0,
+      } satisfies DomainStatus)),
+      ...(subsidyClient && subsidyTools ? [subsidyClient.initialize(subsidyTools.contracts).catch(() => ({
+        configured: true, state: "unavailable", error_code: "SUBSIDY_DOMAIN_UNAVAILABLE", verified_tool_names: [], verified_tool_count: 0,
+      } satisfies SubsidyDomainStatus))] : []),
+    ]);
+
+    return server;
+  } catch (error) {
+    await server.close();
+    throw error;
+  }
 }

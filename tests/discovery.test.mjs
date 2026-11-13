@@ -23,6 +23,22 @@ const childSchema = {
 };
 const contracts = [{ publicName: 'tax_plan', domainName: 'plan_tax', inputSchema: expected }];
 
+const zod4CompatibilitySchema = toJsonSchemaCompat(z.object({
+  limit: z.number().int().min(1).max(20).default(8),
+  omitted: z.string().nullable().optional(),
+  matter: z.object({}).passthrough(),
+}).strict(), { pipeStrategy: 'input' });
+
+test('Zod 4 input schema conversion preserves defaults, optionality, and object key policies', () => {
+  assert.equal(zod4CompatibilitySchema.properties.limit.default, 8);
+  assert.ok(!zod4CompatibilitySchema.required.includes('limit'));
+  assert.ok(!zod4CompatibilitySchema.required.includes('omitted'));
+  assert.notEqual(zod4CompatibilitySchema.properties.matter.additionalProperties, false,
+    'passthrough schemas must accept future fields');
+  assert.equal(zod4CompatibilitySchema.additionalProperties, false,
+    'strict schemas must reject unknown fields');
+});
+
 test('schema contracts tolerate nullable optional extension, titles, descriptions and key order', () => {
   assert.equal(inputSchemasCompatible(expected, childSchema), true);
 });

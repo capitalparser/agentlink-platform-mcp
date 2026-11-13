@@ -22,8 +22,8 @@
     "test:integration:live": "node --test tests/tax/live-evidence-integration.mjs"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.27.1",
-    "zod": "^3.25.67"
+    "@modelcontextprotocol/sdk": "1.32.2",
+    "zod": "4.6.7"
   },
   "devDependencies": {
     "@types/node": "^22.15.21",

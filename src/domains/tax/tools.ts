@@ -184,6 +184,13 @@ export function registerTaxDomainTools(server: McpServer, client: TaxDomainClien
       include_filling_guide: z.boolean().optional().describe("Attach a draft filling guide mapping payments to form fields; not a tax computation (default true, 작성 안내 초안 첨부)"),
     }, true);
 
+  reg("tax_create_draft_bundle", "create_tax_draft_bundle",
+    "Create an offline, response-only review bundle from explicitly supplied VAT purchase rows, corporate ledger/return rows, or existing withholding payment facts. Returns pending JSON and CSV workpapers with traceable input values; it does not fetch sources, decide tax treatment, calculate filing liability, persist artifacts, or file (사용자가 명시적으로 제공한 부가세 매입 행·법인 장부/신고 행 또는 기존 원천징수 지급 사실로 오프라인 검토용 번들을 생성합니다. 추적 가능한 입력 값이 포함된 검토 대기 JSON·CSV 작업표를 반환하며 자료 조회, 세무 판단, 신고세액 계산, 저장 또는 신고는 수행하지 않습니다).",
+    {
+      matter: z.object({}).passthrough().describe("TaxMatter object used to validate the workflow, period, facts, and evidence references"),
+      draft: z.object({}).passthrough().describe("Versioned tax-draft-input.v1 object containing explicit rows or an empty withholding row list"),
+    });
+
   reg("tax_answer_practitioner_question", "answer_practitioner_question",
     "Answer a practitioner question using the common practitioner packet. It may project scoped draft withholding calculations for the supported lecture profiles, ten explicitly listed continuing personal-service subtypes, and three user-confirmed temporary other_personal_service types only when complete facts and matched current-law evidence are available. Supported OTHER profiles may use a user-supplied actual_expense_amount above the 60% standard, including above gross within the existing limit, only with actual_expense_scope_confirmed; neither the assertion nor supporting records are verified. Above-gross output preserves signed payment-level income and separate expense_excess_amount, applies zero withholding to that payment, and does not compute annual netting, offsets, carryforward, or refunds. The final decision is not issued.",
     {

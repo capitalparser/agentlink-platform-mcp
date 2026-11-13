@@ -1,8 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
@@ -123,11 +124,17 @@ test('an unavailable optional subsidy domain does not hide verified tax tools', 
   const { server, client } = await openServer({ taxDomainClient: tax, subsidyDomainClient: invalidSubsidy() });
   try {
     const { tools } = await client.listTools();
-    assert.equal(tools.filter((tool) => tool.name.startsWith('tax_')).length, 21);
+    assert.equal(tools.filter((tool) => tool.name.startsWith('tax_')).length, 22);
     assert.equal(tools.some((tool) => tool.name.startsWith('subsidy_')), false);
+    const draftTool = tools.find((tool) => tool.name === 'tax_create_draft_bundle');
+    assert.ok(draftTool, 'the verified draft bundle tool should be exposed');
+    assert.equal(draftTool.annotations.readOnlyHint, true);
+    assert.equal(draftTool.annotations.destructiveHint, false);
+    assert.equal(draftTool.annotations.idempotentHint, true);
+    assert.equal(draftTool.annotations.openWorldHint, false);
     const status = (await client.callTool({ name: 'agentlink_bridge_status', arguments: {} })).structuredContent;
     assert.equal(status.tax.state, 'ready');
-    assert.equal(status.tax.verified_tool_count, 21);
+    assert.equal(status.tax.verified_tool_count, 22);
     assert.equal(status.subsidy.state, 'invalid');
   } finally {
     await client.close();
@@ -150,6 +157,36 @@ test('close awaits both domains and memoizes cleanup across EOF, rejection and r
   assert.equal(tax.closeCalls, 1);
   assert.equal(subsidy.closeCalls, 1);
   assert.strictEqual(server.close(), firstClose, 'later close calls should reuse the completed close promise');
+});
+
+test('server ownership callback can close before discovery starts', async () => {
+  const events = [];
+  const tax = lifecycleDomainClient('tax', events);
+  const subsidy = lifecycleDomainClient('subsidy', events);
+  let taxInitializations = 0;
+  let subsidyInitializations = 0;
+  const taxInitialize = tax.initialize;
+  const subsidyInitialize = subsidy.initialize;
+  tax.initialize = (...args) => { taxInitializations++; return taxInitialize(...args); };
+  subsidy.initialize = (...args) => { subsidyInitializations++; return subsidyInitialize(...args); };
+  let ownedServer;
+
+  const server = await createServer({
+    taxDomainClient: tax,
+    subsidyDomainClient: subsidy,
+    onServerCreated(created) {
+      ownedServer = created;
+      void created.close();
+    },
+  });
+  await server.close();
+
+  assert.ok(ownedServer === server, 'the early callback owns the returned server');
+  assert.equal(taxInitializations, 0, 'closing from the early callback skips tax discovery');
+  assert.equal(subsidyInitializations, 0, 'closing from the early callback skips subsidy discovery');
+  assert.deepEqual(events, ['tax:started', 'subsidy:started', 'tax:finished', 'subsidy:finished']);
+  assert.equal(tax.closeCalls, 1);
+  assert.equal(subsidy.closeCalls, 1);
 });
 
 test('stdio EOF waits for the tax child shutdown and closes both owned processes', { timeout: 15_000 }, async () => {
@@ -201,6 +238,39 @@ test('repeated SIGTERM signals reuse one awaited upper shutdown', { timeout: 15_
       try { await runtime.transport.close(); } catch { /* test cleanup */ }
     }
     killOwnedPids(ownedPids);
+    rmSync(scratch, { recursive: true, force: true });
+  }
+});
+
+test('SIGTERM during domain initialization closes the owned child before startup can reconnect', { timeout: 12_000 }, async () => {
+  const scratch = mkdtempSync(join(tmpdir(), 'agentlink-upper-init-sigterm-'));
+  const pidFile = join(scratch, 'child-pids.log');
+  const env = {
+    PATH: process.env.PATH ?? '',
+    HOME: scratch,
+    TMPDIR: scratch,
+    AGENTLINK_TAX_MCP_COMMAND: process.execPath,
+    AGENTLINK_TAX_MCP_ARGS: JSON.stringify([fakeTaxChild, pidFile, 'initialization-hang-ignore-sigterm']),
+    AGENTLINK_CREDENTIALS_PATH: join(scratch, 'missing-credentials.json'),
+  };
+  let upper;
+  let ownedPids = [];
+  try {
+    upper = spawn(process.execPath, [installedUpper], { cwd: scratch, env, stdio: ['pipe', 'ignore', 'ignore'] });
+    const deadline = Date.now() + 5_000;
+    while (!existsSync(pidFile) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 25));
+    assert.equal(existsSync(pidFile), true, 'initializing domain child should record its pid');
+    const [childPid, recordedUpperPid] = readFileSync(pidFile, 'utf8').trim().split(/\s+/).map(Number);
+    ownedPids = [childPid, upper.pid];
+    assert.equal(recordedUpperPid, upper.pid);
+    const started = Date.now();
+    upper.kill('SIGTERM');
+    const exited = await Promise.all(ownedPids.map(pid => waitForPidExit(pid, 7_000)));
+    assert.ok(Date.now() - started < 8_000, 'upper shutdown completes within six seconds plus process exit tolerance');
+    assert.deepEqual(exited, [true, true], 'startup cancellation closes the upper and its nested child');
+  } finally {
+    killOwnedPids(ownedPids);
+    upper?.stdin?.destroy();
     rmSync(scratch, { recursive: true, force: true });
   }
 });

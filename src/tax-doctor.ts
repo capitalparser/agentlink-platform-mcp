@@ -3,6 +3,7 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { CallToolResultSchema } from "@modelcontextprotocol/sdk/types.js";
+import { realpathSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -191,6 +192,25 @@ function toolNamesFromList(value: unknown): string[] | undefined {
   return parsed ?? undefined;
 }
 
+function ownUpperTransport(transport: StdioClientTransport): () => Promise<void> {
+  let closePromise: Promise<void> | undefined;
+  const originalClose = transport.close.bind(transport);
+  const close = (): Promise<void> => {
+    if (!closePromise) {
+      closePromise = Promise.resolve().then(async () => {
+        try {
+          await requestUpperShutdown(transport);
+        } finally {
+          await originalClose();
+        }
+      });
+    }
+    return closePromise;
+  };
+  transport.close = close;
+  return close;
+}
+
 export async function runDoctor(): Promise<DoctorReport> {
   const deadline = Date.now() + TOTAL_WORK_TIMEOUT_MS;
   const observations: InstallationObservations = { upperConnected: false };
@@ -201,6 +221,7 @@ export async function runDoctor(): Promise<DoctorReport> {
     transport = new StdioClientTransport({ command: process.execPath, args: [installedUpper], stderr: "pipe", env: callerEnvironment() });
     transport.stderr?.on("data", () => {});
     transport.onerror = () => {};
+    ownUpperTransport(transport);
     client = new Client({ name: "agentlink-tax-doctor", version: "1.0.0" });
     client.onerror = () => {};
     await client.connect(transport, { timeout: requestTimeout(deadline) });
@@ -230,16 +251,11 @@ export async function runDoctor(): Promise<DoctorReport> {
   } catch {
     // Fixed check codes below carry all public diagnostics.
   } finally {
-    if (transport && transport.pid !== null && transport.pid > 0) {
-      try { await requestUpperShutdown(transport); } catch { /* SDK cleanup below remains the fallback */ }
-    }
     if (client) {
       try { await client.close(); } catch { /* startup and transport failures stay private */ }
-    } else if (transport) {
-      try { await transport.close(); } catch { /* startup and transport failures stay private */ }
     }
-    if (transport?.pid !== null && transport?.pid !== undefined) {
-      try { await transport.close(); } catch { /* retry cleanup without reporting process details */ }
+    if (transport) {
+      try { await transport.close(); } catch { /* startup and transport failures stay private */ }
     }
   }
   return assessInstallation(observations);
@@ -256,6 +272,16 @@ async function main(): Promise<void> {
   if (report.preparation_status !== "ready") process.exitCode = 1;
 }
 
-if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
+const isCliEntry = (() => {
+  const argumentEntry = process.argv[1];
+  if (!argumentEntry) return false;
+  try {
+    return realpathSync(fileURLToPath(import.meta.url)) === realpathSync(resolve(argumentEntry));
+  } catch {
+    return false;
+  }
+})();
+
+if (isCliEntry) {
   void main();
 }
