@@ -60,6 +60,10 @@ test("installed tax child matches the native and upper review matrix over MCP st
     ? "Set AGENTLINK_TEST_TAX_PYTHON to run the installed tax integration."
     : false,
 }, async () => {
+  if (required) {
+    assert.equal(registry, undefined,
+      "AGENTLINK_REQUIRE_TAX_INTEGRATION=1 forbids AGENTLINK_TEST_TAX_REGISTRY");
+  }
   assert.ok(python && existsSync(python), "AGENTLINK_TEST_TAX_PYTHON must name an installed tax-wheel interpreter");
   if (registry !== undefined) {
     assert.ok(existsSync(registry), "AGENTLINK_TEST_TAX_REGISTRY was explicitly set but does not exist");
