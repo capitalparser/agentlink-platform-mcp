@@ -948,16 +948,38 @@ test("child isError -> TAX_DOMAIN_TOOL_ERROR with fixed safe message", async () 
   await c.close();
 });
 
-test("timeout returns TAX_DOMAIN_TIMEOUT and does not reset the shared child", async () => {
+test("timeout returns TAX_DOMAIN_TIMEOUT and does not reset the shared child", { timeout: 25_000 }, async () => {
   const log = logPath();
-  const c = await fake(log, { timeoutMs: 300 });
-  const r0 = await c.callTool("ping", {});
-  const t = await c.callTool("sleep", {});
-  assert.equal(t.error_code, "TAX_DOMAIN_TIMEOUT");
-  const r1 = await c.callTool("ping", {});
-  assert.equal(r1.pid, r0.pid);
-  assert.equal(pids(log).length, 1);
-  await c.close();
+  const c = new TaxDomainClient(
+    { command: process.execPath, args: [FAKE, log], timeoutMs: 3_000 },
+    { PATH: process.env.PATH },
+  );
+  const assertSingleStartup = (pid) => {
+    const rows = pids(log);
+    assert.equal(rows.length, 1);
+    assert.equal(Number(rows[0].trim().split(/\s+/)[0]), pid);
+  };
+  try {
+    await c.initialize(FAKE_CONTRACTS);
+    assert.equal(c.getStatus().state, "ready");
+
+    const r0 = await c.callTool("ping", {});
+    assert.ok(Number.isInteger(r0.pid) && r0.pid > 0);
+    assertSingleStartup(r0.pid);
+
+    const t = await c.callTool("sleep", {});
+    assert.equal(t.schema_version, "tax-bridge-error.v1");
+    assert.equal(t.error_code, "TAX_DOMAIN_TIMEOUT");
+    assert.equal(c.getStatus().state, "ready");
+    assertSingleStartup(r0.pid);
+
+    const r1 = await c.callTool("ping", {});
+    assert.ok(Number.isInteger(r1.pid) && r1.pid > 0);
+    assert.equal(r1.pid, r0.pid);
+    assertSingleStartup(r1.pid);
+  } finally {
+    await c.close();
+  }
 });
 
 test("connect failure eager close and domain shutdown share one awaited transport close", { timeout: 10_000 }, async () => {

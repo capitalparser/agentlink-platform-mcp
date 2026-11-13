@@ -46,7 +46,8 @@ for (let index = 0; index < registered.contracts.length; index++) {
 server.tool('ping', 'ping', {}, async () => ok({ pid: process.pid }));
 server.tool('crash', 'crash', {}, async () => { process.exit(1); });
 server.tool('sleep', 'sleep', {}, async () => {
-  await new Promise((resolve) => setTimeout(resolve, 1000));
+  // Exceeds the request-timeout regression's 3000 ms client budget.
+  await new Promise((resolve) => setTimeout(resolve, 10000));
   return ok({ slept: true });
 });
 server.tool('env_check', 'env', {}, async () => ok({
