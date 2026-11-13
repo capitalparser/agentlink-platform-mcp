@@ -2,7 +2,7 @@
 // (which carries its canonical registry) and a selected upper entry point.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
@@ -18,11 +18,18 @@ import {
 const python = process.env.AGENTLINK_TEST_TAX_PYTHON;
 const registry = process.env.AGENTLINK_TEST_TAX_REGISTRY;
 const upperEntry = process.env.AGENTLINK_TEST_UPPER_ENTRY;
+const draftFixtureDir = process.env.AGENTLINK_TEST_TAX_DRAFT_FIXTURES;
 const missingPython = !python || !existsSync(python);
 const invalidOverride = registry !== undefined && !existsSync(registry);
 const invalidUpperEntry = upperEntry !== undefined && (!isAbsolute(upperEntry) || !isFile(upperEntry));
 const required = process.env.AGENTLINK_REQUIRE_TAX_INTEGRATION === "1";
 const STDERR_LIMIT = 8 * 1024;
+const DRAFT_FIXTURES = [
+  "draft-vat.json",
+  "draft-corporate.json",
+  "draft-withholding.json",
+  "expected.json",
+];
 
 function isFile(path) {
   try {
@@ -30,6 +37,86 @@ function isFile(path) {
   } catch {
     return false;
   }
+}
+
+function isDirectory(path) {
+  try {
+    return statSync(path).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function readDraftFixture(filename) {
+  assert.ok(draftFixtureDir && isAbsolute(draftFixtureDir) && isDirectory(draftFixtureDir),
+    "AGENTLINK_TEST_TAX_DRAFT_FIXTURES must name the absolute fixture directory from the domain-tax checkout");
+  return JSON.parse(readFileSync(join(draftFixtureDir, filename), "utf8"));
+}
+
+function parseCsv(text) {
+  const rows = [];
+  let row = [];
+  let cell = "";
+  let quoted = false;
+  for (let index = 0; index < text.length; index += 1) {
+    const char = text[index];
+    if (quoted) {
+      if (char === '"' && text[index + 1] === '"') {
+        cell += '"';
+        index += 1;
+      } else if (char === '"') {
+        quoted = false;
+      } else {
+        cell += char;
+      }
+    } else if (char === '"' && cell.length === 0) {
+      quoted = true;
+    } else if (char === ",") {
+      row.push(cell);
+      cell = "";
+    } else if (char === "\n" || char === "\r") {
+      if (char === "\r" && text[index + 1] === "\n") index += 1;
+      row.push(cell);
+      rows.push(row);
+      row = [];
+      cell = "";
+    } else {
+      cell += char;
+    }
+  }
+  assert.equal(quoted, false, "CSV must have balanced RFC4180 quotes");
+  if (cell.length > 0 || row.length > 0) {
+    row.push(cell);
+    rows.push(row);
+  }
+  assert.ok(rows.length > 0, "CSV export must have a header row");
+  const [headers, ...values] = rows;
+  assert.equal(new Set(headers).size, headers.length, "CSV headers must be unique");
+  const parsedRows = values.map((valuesRow) => {
+    assert.equal(valuesRow.length, headers.length, "CSV rows must match their header width");
+    return Object.fromEntries(headers.map((header, index) => [header, valuesRow[index]]));
+  });
+  return { headers, rows: parsedRows };
+}
+
+function assertDraftExports(result) {
+  assert.equal(result.schema_version, "tax-draft-bundle.v1");
+  assert.equal(result.status, "draft");
+  assert.equal(result.review, "pending");
+  assert.equal(result.applicability, "not_determined");
+  assert.equal(result.filing_status, "not_supported");
+  assert.equal(result.source_verification, "user_supplied_unverified");
+  assert.deepEqual(result.storage, { mode: "response_only", server_persisted: false, expires_at: null });
+  assert.equal(result.exports.length, 2);
+  const jsonExport = result.exports.find((item) => item.filename === "draft.json");
+  const csvExport = result.exports.find((item) => item.filename === "workpaper.csv");
+  assert.equal(jsonExport?.media_type, "application/json");
+  assert.equal(csvExport?.media_type, "text/csv");
+  const exported = JSON.parse(jsonExport.text);
+  assert.deepEqual(exported.draft, result.draft, "draft.json must preserve the full draft");
+  assert.deepEqual(exported.report, result.report, "draft.json must preserve the common report");
+  const csv = parseCsv(csvExport.text);
+  return { csvHeaders: csv.headers, csvRows: csv.rows, csvText: csvExport.text };
 }
 
 function payment(overrides = {}) {
@@ -63,6 +150,12 @@ test("installed tax child matches the native and upper review matrix over MCP st
   if (required) {
     assert.equal(registry, undefined,
       "AGENTLINK_REQUIRE_TAX_INTEGRATION=1 forbids AGENTLINK_TEST_TAX_REGISTRY");
+    assert.ok(draftFixtureDir && isAbsolute(draftFixtureDir) && isDirectory(draftFixtureDir),
+      "required installed mode needs an absolute AGENTLINK_TEST_TAX_DRAFT_FIXTURES directory");
+    for (const filename of DRAFT_FIXTURES) {
+      assert.ok(isFile(join(draftFixtureDir, filename)),
+        `required installed mode needs the fixed ${filename} test fixture`);
+    }
   }
   assert.ok(python && existsSync(python), "AGENTLINK_TEST_TAX_PYTHON must name an installed tax-wheel interpreter");
   if (registry !== undefined) {
@@ -158,8 +251,11 @@ test("installed tax child matches the native and upper review matrix over MCP st
     const nativeNames = nativeTools.map((tool) => tool.name);
     const taxNames = names.filter((name) => name.startsWith("tax_"));
     const bridgeStatus = await call("agentlink_bridge_status");
-    assert.equal(taxNames.length, 19,
+    assert.equal(taxNames.length, 22,
       `all mapped tax tools should be exposed after real child discovery; status=${JSON.stringify(bridgeStatus)}; tools=${names.join(",")}`);
+    for (const name of ["tax_route_question", "tax_health"]) {
+      assert.ok(names.includes(name), `missing required ${name}`);
+    }
     const lawArticleTool = tools.find((tool) => tool.name === "tax_get_law_article");
     assert.ok(lawArticleTool, "the public law article tool should be advertised");
     assert.deepEqual(lawArticleTool.inputSchema.properties.lookup_basis.enum, ["promulgation", "effective"]);
@@ -170,10 +266,10 @@ test("installed tax child matches the native and upper review matrix over MCP st
     assert.deepEqual(nativeLawArticleTool.inputSchema.properties.lookup_basis.enum, ["promulgation", "effective"]);
     assert.ok(!nativeLawArticleTool.inputSchema.required?.includes("lookup_basis"),
       "lookup_basis remains optional in the native contract");
-    for (const name of ["tax_list_workflows", "tax_get_workflow_contract", "tax_plan_work"]) {
+    for (const name of ["tax_list_workflows", "tax_get_workflow_contract", "tax_plan_work", "tax_route_question", "tax_health"]) {
       assert.ok(names.includes(name), `missing ${name}`);
     }
-    for (const name of ["list_tax_workflows", "get_workflow_contract", "plan_tax_work",
+    for (const name of ["list_tax_workflows", "get_workflow_contract", "plan_tax_work", "route_tax_question", "health",
       "answer_practitioner_question", "get_law_article"]) {
       assert.ok(nativeNames.includes(name), `native tools/list is missing ${name}`);
     }
@@ -181,6 +277,168 @@ test("installed tax child matches the native and upper review matrix over MCP st
     assert.ok(names.every((name) => name === "agentlink_bridge_status" || name.startsWith("tax_")),
       "default startup should expose only verified tax tools and bridge status");
     assert.ok(!names.some((name) => name.startsWith("subsidy_")), "the optional subsidy domain must stay absent");
+    const draftBundleTool = tools.find((tool) => tool.name === "tax_create_draft_bundle");
+    assert.ok(draftBundleTool, "the public draft bundle tool must be advertised after child discovery");
+    assert.deepEqual(draftBundleTool.inputSchema.required?.slice().sort(), ["draft", "matter"]);
+    assert.deepEqual(Object.keys(draftBundleTool.inputSchema.properties).sort(), ["draft", "matter"]);
+    assert.notEqual(draftBundleTool.inputSchema.properties.matter.additionalProperties, false,
+      "the upper contract must pass through future matter fields");
+    assert.notEqual(draftBundleTool.inputSchema.properties.draft.additionalProperties, false,
+      "the upper contract must pass through the versioned draft object intact");
+    assert.deepEqual(draftBundleTool.annotations, {
+      readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false,
+    });
+    const nativeDraftBundleTool = nativeTools.find((tool) => tool.name === "create_tax_draft_bundle");
+    assert.ok(nativeDraftBundleTool, "the native draft bundle tool must be advertised");
+    assert.deepEqual(nativeDraftBundleTool.inputSchema.required?.slice().sort(), ["draft", "matter"]);
+    assert.deepEqual(nativeDraftBundleTool.annotations, {
+      readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false,
+    });
+
+    if (draftFixtureDir !== undefined || required) {
+      assert.ok(draftFixtureDir && isAbsolute(draftFixtureDir) && isDirectory(draftFixtureDir),
+        "AGENTLINK_TEST_TAX_DRAFT_FIXTURES must name an absolute directory");
+      const fixtureInputs = [
+        ["vat", readDraftFixture("draft-vat.json")],
+        ["corporate", readDraftFixture("draft-corporate.json")],
+        ["withholding", readDraftFixture("draft-withholding.json")],
+      ];
+      const expected = readDraftFixture("expected.json");
+      for (const [caseName, fixture] of fixtureInputs) {
+        const args = { matter: fixture.matter, draft: fixture.draft };
+        const [nativeResult, upperResult] = await Promise.all([
+          callNative("create_tax_draft_bundle", args),
+          call("tax_create_draft_bundle", args),
+        ]);
+        assert.deepEqual(upperResult, nativeResult,
+          `${caseName} upper result must preserve the actual installed native result`);
+        assertDraftExports(nativeResult);
+        assertDraftExports(upperResult);
+        assert.equal(upperResult.report.tier, "public");
+        assert.deepEqual(upperResult.report.insights_included, []);
+
+        if (caseName === "vat") {
+          assert.equal(upperResult.kind, "vat_purchase");
+          assert.equal(upperResult.workflow_id, "vat-return");
+          assert.equal(upperResult.focus_id, "purchase-review");
+          assert.equal(upperResult.draft.summary.supply_amount.value, expected.vat.supply_amount.value);
+          assert.equal(upperResult.draft.summary.supply_amount.supplied_subtotal.value,
+            expected.vat.supply_amount.supplied_subtotal);
+          assert.equal(upperResult.draft.summary.vat_amount.value, expected.vat.vat_amount.value);
+          assert.equal(upperResult.draft.summary.vat_amount.supplied_subtotal.value,
+            expected.vat.vat_amount.supplied_subtotal);
+          assert.equal(upperResult.draft.summary.vat_amount.missing_count, expected.vat.vat_amount.missing_count);
+          assert.deepEqual(upperResult.draft.summary.vat_amount.supplied_subtotal.provenance.input_refs,
+            expected.vat.vat_input_refs);
+          const vatRows = Object.fromEntries(upperResult.draft.rows.map((row) => [row.row_id, row]));
+          assert.equal(vatRows["v-b"].vat_amount.value, null, "null VAT must remain missing rather than zero");
+          assert.equal(vatRows["v-b"].vat_amount.status, "missing");
+          assert.equal(vatRows["v-c"].supply_amount.value, "0", "explicit zero must survive the upper bridge");
+          assert.equal(vatRows["v-d"].supply_amount.value, "-25.5", "signed corrections must survive the upper bridge");
+          assert.deepEqual(vatRows["v-a"].supply_amount.provenance.input_refs, ["rows[v-a].supply_amount"]);
+          assert.deepEqual(vatRows["v-a"].supply_amount.provenance.evidence_refs, ["ev-a"]);
+          const { csvHeaders, csvRows } = assertDraftExports(upperResult);
+          assert.equal(csvHeaders[0], "row_kind");
+          assert.equal(csvRows.filter((row) => row.row_kind === "data").length, 4);
+          assert.equal(csvRows.filter((row) => row.row_kind === "summary").length, 2);
+          const vatMissingRow = csvRows.find((row) => row.row_id === "v-b");
+          assert.equal(vatMissingRow.vat_amount, "");
+          assert.ok(vatMissingRow.missing_fields.includes("vat_amount"),
+            "CSV must explicitly identify null VAT values as missing");
+          assert.equal(csvRows.find((row) => row.row_id === "v-c").supply_amount, "0");
+          assert.ok(csvRows.find((row) => row.row_id === "v-a").evidence_refs.includes("ev-a"),
+            "CSV must retain row evidence references");
+          const vatSummary = csvRows.find((row) => row.summary_field === "vat_amount");
+          assert.equal(vatSummary.summary_value, "");
+          assert.equal(vatSummary.summary_missing_count, String(expected.vat.vat_amount.missing_count));
+          assert.equal(vatSummary.contributing_row_ids, "v-a;v-c;v-d");
+        } else if (caseName === "corporate") {
+          assert.equal(upperResult.kind, "corporate_reconciliation");
+          assert.equal(upperResult.workflow_id, "corporate-adjustment");
+          assert.equal(upperResult.focus_id, "closing-reconciliation");
+          const summary = upperResult.draft.summary;
+          for (const key of ["comparable_count", "incomplete_count", "nonzero_difference_count", "review_status",
+            "differences_unresolved"]) {
+            assert.equal(summary[key], expected.corporate[key], `corporate ${key} expectation mismatch`);
+          }
+          assert.equal(summary.comparable_difference_sum.value, expected.corporate.comparable_difference_sum);
+          assert.equal(summary.absolute_difference_sum.value, expected.corporate.absolute_difference_sum);
+          assert.equal(upperResult.draft.book_verification, "user_supplied_unverified");
+          const corporateRows = Object.fromEntries(upperResult.draft.rows.map((row) => [row.row_id, row]));
+          assert.equal(corporateRows["c-a"].difference.value, "10");
+          assert.equal(corporateRows["c-b"].difference.value, "-10");
+          assert.equal(corporateRows["c-c"].difference.value, null);
+          assert.equal(corporateRows["c-c"].comparison_status, "incomplete");
+          assert.equal(corporateRows["c-z"].difference.value, "0");
+          assert.equal(corporateRows["c-z"].comparison_status, "equal_unverified");
+          assert.deepEqual(corporateRows["c-a"].difference.provenance.input_refs,
+            ["rows[c-a].ledger_amount", "rows[c-a].return_amount"]);
+          assert.deepEqual(corporateRows["c-a"].difference.provenance.evidence_refs, ["ev-corp-a"]);
+          const { csvHeaders, csvRows } = assertDraftExports(upperResult);
+          assert.equal(csvHeaders[0], "row_kind");
+          assert.equal(csvRows.filter((row) => row.row_kind === "data").length, 4);
+          const corporateCsvRows = Object.fromEntries(csvRows.filter((row) => row.row_kind === "data")
+            .map((row) => [row.row_id, row]));
+          assert.equal(corporateCsvRows["c-a"].difference, "10");
+          assert.equal(corporateCsvRows["c-b"].difference, "-10");
+          assert.equal(corporateCsvRows["c-c"].difference, "");
+          assert.ok(corporateCsvRows["c-c"].missing_fields.includes("return_amount"),
+            "CSV must explicitly identify incomplete corporate amounts");
+          assert.equal(corporateCsvRows["c-z"].difference, "0");
+          const corporateSummary = Object.fromEntries(csvRows.filter((row) => row.row_kind === "summary")
+            .map((row) => [row.summary_field, row]));
+          assert.equal(corporateSummary.comparable_difference_sum.summary_value,
+            expected.corporate.comparable_difference_sum);
+          assert.equal(corporateSummary.absolute_difference_sum.summary_value,
+            expected.corporate.absolute_difference_sum);
+          assert.equal(corporateSummary.absolute_difference_sum.contributing_row_ids, "c-a;c-b;c-z");
+        } else {
+          assert.equal(upperResult.kind, "withholding");
+          assert.equal(upperResult.workflow_id, "withholding-payment");
+          assert.equal(upperResult.focus_id, null);
+          assert.deepEqual(upperResult.draft.summary, {
+            sheet_count: expected.withholding.sheet_count,
+            payment_count: expected.withholding.payment_count,
+          });
+          assert.deepEqual(upperResult.draft.rows, []);
+          const a01 = upperResult.draft.filling_guide.flatMap((sheet) => sheet.rows)
+            .find((row) => row.code === "A01");
+          assert.ok(a01, "withholding should reuse the existing A01 filling guide");
+          const cells = Object.fromEntries(a01.cells.map((cell) => [cell.column, cell]));
+          assert.equal(cells["⑤총지급액"].value, expected.withholding.a01_gross);
+          assert.equal(cells["④인원"].value, expected.withholding.a01_headcount);
+          assert.equal(cells["⑥징수세액-소득세 등"].value, expected.withholding.a01_withheld);
+          assert.equal(cells["⑥징수세액-소득세 등"].status, expected.withholding.a01_withheld_status);
+          assert.deepEqual(cells["⑤총지급액"].provenance.fact_refs,
+            expected.withholding.a01_gross_payment_ids);
+          const { csvHeaders, csvRows } = assertDraftExports(upperResult);
+          assert.deepEqual(csvHeaders,
+            ["sheet_id", "row_id", "payment_ids", "column", "value", "status", "unit", "flags"]);
+          assert.ok(csvRows.every((row) => !Object.hasOwn(row, "row_kind")));
+          const grossCsv = csvRows.find((row) => row.column === "⑤총지급액");
+          assert.equal(grossCsv.value, expected.withholding.a01_gross);
+          assert.equal(grossCsv.payment_ids, expected.withholding.a01_gross_payment_ids.join(";"));
+          const withheldCsv = csvRows.find((row) => row.column === "⑥징수세액-소득세 등");
+          assert.equal(withheldCsv.value, "");
+          assert.equal(withheldCsv.status, expected.withholding.a01_withheld_status);
+        }
+      }
+
+      const vatFixture = readDraftFixture("draft-vat.json");
+      vatFixture.draft.rows[0].evidence_refs = ["missing-evidence"];
+      const malformedArgs = { matter: vatFixture.matter, draft: vatFixture.draft };
+      const [nativeMalformed, upperMalformed] = await Promise.all([
+        callNative("create_tax_draft_bundle", malformedArgs),
+        call("tax_create_draft_bundle", malformedArgs),
+      ]);
+      assert.deepEqual(upperMalformed, nativeMalformed,
+        "malformed references must fail identically across native and upper surfaces");
+      assert.deepEqual(upperMalformed, {
+        error: "invalid_input", field: "draft", code: "invalid_reference",
+      });
+      assert.ok(!Object.hasOwn(upperMalformed, "draft") && !Object.hasOwn(upperMalformed, "exports"),
+        "malformed reference errors must not include partial artifacts");
+    }
 
     const plan = (taxMatter) => call("tax_plan_work", { matter: taxMatter, include_evidence: false });
     const planNative = (taxMatter) => callNative("plan_tax_work", { matter: taxMatter, include_evidence: false });
@@ -189,6 +447,18 @@ test("installed tax child matches the native and upper review matrix over MCP st
       call("tax_list_workflows"),
       callNative("list_tax_workflows"),
     ]);
+    const [health, nativeHealth] = await Promise.all([call("tax_health"), callNative("health")]);
+    assert.deepEqual(health, nativeHealth, "upper health should preserve native health fields");
+    assert.equal(health.status, "ok");
+    assert.ok(Number.isInteger(health.workflows));
+    const question = "부가세 매입 세금계산서 검토";
+    const [route, nativeRoute] = await Promise.all([
+      call("tax_route_question", { question }),
+      callNative("route_tax_question", { question }),
+    ]);
+    assert.deepEqual(route, nativeRoute, "upper question routing should preserve the native result");
+    assert.equal(route.status, "matched");
+    assert.equal(route.candidates[0]?.workflow_id, "vat-return");
     assert.equal(workflowList.domain, "tax");
     assertWorkflowMatrix(workflowList.workflows);
     assertWorkflowMatrix(nativeWorkflowList.workflows);

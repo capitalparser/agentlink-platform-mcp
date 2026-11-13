@@ -157,6 +157,14 @@ export function registerTaxDomainTools(server: McpServer, client: TaxDomainClien
     contracts.push({ publicName: name, domainName: domainTool, inputSchema: toJsonSchemaCompat(z.object(shape), { pipeStrategy: "input" }) });
   };
 
+  reg("tax_route_question", "route_tax_question",
+    "Find possible tax workflows from a question using a closed keyword registry. Candidates require user confirmation; this is not legal or semantic classification (질문에서 키워드 기준 세무 업무 후보를 찾습니다. 후보는 사용자가 확인해야 하며 법률·의미 분류가 아닙니다).",
+    { question: z.string().max(500).describe("Tax preparation question, at most 500 characters (세무 준비 질문, 최대 500자)") });
+
+  reg("tax_health", "health",
+    "Show tax-domain health and credential-presence booleans only. Credential presence does not prove authorization or successful provider access (세무 도메인 상태와 자격증명 존재 여부만 표시합니다. 자격증명 존재가 인증·제공처 조회 성공을 뜻하지 않습니다).",
+    {});
+
   reg("tax_list_workflows", "list_tax_workflows",
     "List the tax sub-workflows and their implementation status (세무 하위 업무와 구현 상태 목록).", {});
 
@@ -175,6 +183,13 @@ export function registerTaxDomainTools(server: McpServer, client: TaxDomainClien
       include_evidence: z.boolean().optional().describe("Attach current law text, official form links and evidence candidates from law.go.kr; selected lecture, personal-service, and other_personal_service calculations require matched current-law evidence (default true, 현행 법령 본문·서식 원본·근거 후보 첨부; 선택한 강의·인적용역 계산은 현행 법령 대조 필요)"),
       include_filling_guide: z.boolean().optional().describe("Attach a draft filling guide mapping payments to form fields; not a tax computation (default true, 작성 안내 초안 첨부)"),
     }, true);
+
+  reg("tax_create_draft_bundle", "create_tax_draft_bundle",
+    "Create an offline, response-only review bundle from explicitly supplied VAT purchase rows, corporate ledger/return rows, or existing withholding payment facts. Returns pending JSON and CSV workpapers with traceable input values; it does not fetch sources, decide tax treatment, calculate filing liability, persist artifacts, or file (사용자가 명시적으로 제공한 부가세 매입 행·법인 장부/신고 행 또는 기존 원천징수 지급 사실로 오프라인 검토용 번들을 생성합니다. 추적 가능한 입력 값이 포함된 검토 대기 JSON·CSV 작업표를 반환하며 자료 조회, 세무 판단, 신고세액 계산, 저장 또는 신고는 수행하지 않습니다).",
+    {
+      matter: z.object({}).passthrough().describe("TaxMatter object used to validate the workflow, period, facts, and evidence references"),
+      draft: z.object({}).passthrough().describe("Versioned tax-draft-input.v1 object containing explicit rows or an empty withholding row list"),
+    });
 
   reg("tax_answer_practitioner_question", "answer_practitioner_question",
     "Answer a practitioner question using the common practitioner packet. It may project scoped draft withholding calculations for the supported lecture profiles, ten explicitly listed continuing personal-service subtypes, and three user-confirmed temporary other_personal_service types only when complete facts and matched current-law evidence are available. Supported OTHER profiles may use a user-supplied actual_expense_amount above the 60% standard, including above gross within the existing limit, only with actual_expense_scope_confirmed; neither the assertion nor supporting records are verified. Above-gross output preserves signed payment-level income and separate expense_excess_amount, applies zero withholding to that payment, and does not compute annual netting, offsets, carryforward, or refunds. The final decision is not issued.",

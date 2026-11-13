@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createServer } from "../../dist/server.js";
@@ -16,12 +17,12 @@ import { memoryDomainClient, genericContracts } from "./fixtures/memory-domain-c
 import { assertWorkflowMatrix, FOCUS_EXPECTATIONS, WORKFLOW_EXPECTATIONS } from "./fixtures/review-expectations.mjs";
 
 const TAX_TOOLS = [
-  "tax_list_workflows", "tax_get_workflow_contract", "tax_plan_work", "tax_get_automation_offer",
+  "tax_list_workflows", "tax_route_question", "tax_health", "tax_get_workflow_contract", "tax_plan_work", "tax_get_automation_offer",
   "tax_list_rule_cards", "tax_search_law", "tax_get_law_article", "tax_check_business_status",
   "tax_list_practice_cards", "tax_list_holidays", "tax_get_schedule",
   "tax_find_office", "tax_search_interpretations", "tax_get_tribunal_decision",
   "tax_search_forms", "tax_list_form_guides", "tax_get_form_field_tips",
-  "tax_answer_practitioner_question", "tax_export_rule_cards",
+  "tax_answer_practitioner_question", "tax_export_rule_cards", "tax_create_draft_bundle",
 ];
 
 async function connect(taxDomainClient) {
@@ -42,7 +43,7 @@ async function connectWithCallToolResult(callToolResult) {
   return { server, client };
 }
 
-test("tool list has 19 read-only tax tools; signed calculation content passes through unchanged", async () => {
+test("tool list has 22 read-only tax tools; signed calculation content passes through unchanged", async () => {
   const automation_offer = {
     schema_version: "automation-offer.v1",
     label: "automation_offer_not_legal_content",
@@ -72,7 +73,7 @@ test("tool list has 19 read-only tax tools; signed calculation content passes th
   };
   const { client } = await connect(fake);
   const { tools } = await client.listTools();
-  assert.equal(tools.filter((t) => t.name.startsWith("tax_")).length, 19);
+  assert.equal(tools.filter((t) => t.name.startsWith("tax_")).length, 22);
   for (const n of TAX_TOOLS) {
     const t = tools.find((x) => x.name === n);
     assert.ok(t, `missing ${n}`);
@@ -80,15 +81,40 @@ test("tool list has 19 read-only tax tools; signed calculation content passes th
   }
   assert.ok(tools.find((x) => x.name === "agentlink_bridge_status"), "diagnostic tool is available");
   assert.ok(tools.find((x) => x.name === "get_vat_data"), "explicit demo tools are available in this test");
-  const res = await client.callTool({ name: "tax_plan_work", arguments: { matter: { matter_id: "m", extra: 1 } } });
+  const routeSchema = tools.find((tool) => tool.name === "tax_route_question")?.inputSchema;
+  assert.deepEqual(routeSchema?.required, ["question"]);
+  assert.equal(routeSchema?.properties?.question?.maxLength, 500);
+  assert.deepEqual(tools.find((tool) => tool.name === "tax_health")?.inputSchema?.properties, {});
+  const matter = {
+    matter_id: "m", extra: 1, amount: 0, explicit_null: null, amount_text: "0",
+    new_evidence_fields: { records: [{ amount: 0, note: null, source_amount: "0" }] },
+  };
+  const matterSchema = tools.find((tool) => tool.name === "tax_plan_work")?.inputSchema?.properties?.matter;
+  assert.notEqual(matterSchema?.additionalProperties, false, "TaxMatter must keep future fields open");
+  const draftBundleTool = tools.find((tool) => tool.name === "tax_create_draft_bundle");
+  assert.deepEqual(draftBundleTool.inputSchema.required?.slice().sort(), ["draft", "matter"]);
+  assert.notEqual(draftBundleTool.inputSchema.properties.matter.additionalProperties, false);
+  assert.notEqual(draftBundleTool.inputSchema.properties.draft.additionalProperties, false);
+  assert.equal(draftBundleTool.annotations.readOnlyHint, true);
+  assert.equal(draftBundleTool.annotations.destructiveHint, false);
+  assert.equal(draftBundleTool.annotations.idempotentHint, true);
+  assert.equal(draftBundleTool.annotations.openWorldHint, false);
+  const searchSchema = tools.find((tool) => tool.name === "tax_search_law")?.inputSchema;
+  assert.equal(searchSchema?.properties?.target?.default, "law");
+  assert.equal(searchSchema?.properties?.limit?.default, 10);
+  const res = await client.callTool({ name: "tax_plan_work", arguments: { matter } });
   assert.deepEqual(res.structuredContent, payload);
   assert.deepEqual(res.structuredContent.automation_offer, automation_offer);
   assert.deepEqual(JSON.parse(res.content[0].text), payload);
-  assert.deepEqual(calls[0], ["plan_tax_work", { matter: { matter_id: "m", extra: 1 } }]);
+  assert.deepEqual(calls[0], ["plan_tax_work", { matter }]);
   await client.callTool({ name: "tax_search_law", arguments: { query: "원천징수" } });
   assert.deepEqual(calls[1], ["search_tax_law", { query: "원천징수", target: "law", limit: 10 }]);
   await client.callTool({ name: "tax_get_law_article", arguments: { law_name: "소득세법", article: "제128조", law_id: "001565" } });
   assert.deepEqual(calls[2], ["get_law_article", { law_name: "소득세법", article: "제128조", law_id: "001565" }]);
+  await client.callTool({ name: "tax_route_question", arguments: { question: "부가세 매입 자료 검토" } });
+  assert.deepEqual(calls[3], ["route_tax_question", { question: "부가세 매입 자료 검토" }]);
+  await client.callTool({ name: "tax_health", arguments: {} });
+  assert.deepEqual(calls[4], ["health", {}]);
   for (const name of ["tax_answer_practitioner_question", "tax_export_rule_cards"]) {
     const args = name === "tax_answer_practitioner_question" ? { matter: {} } : {};
     const result = await client.callTool({ name, arguments: args });
@@ -99,6 +125,40 @@ test("tool list has 19 read-only tax tools; signed calculation content passes th
       name === "tax_answer_practitioner_question");
   }
   assert.equal(tools.find((t) => t.name === "tax_plan_work").annotations.openWorldHint, true);
+  assert.equal(draftBundleTool.annotations.openWorldHint, false);
+});
+
+test("draft bundle input preserves nested strings, nulls and zeros through the fake domain bridge", async () => {
+  const calls = [];
+  const fake = { async callTool(name, args) { calls.push([name, args]); return { status: "accepted" }; }, async close() {} };
+  const { client } = await connect(fake);
+  try {
+    const matter = {
+      matter_id: "draft-matter",
+      workflow_id: "vat-return",
+      facts: { guidance_focus: "purchase-review", count: 0, amount_text: "0", optional: null },
+      evidence: [{ id: "ev-a", sha256: null, metadata: { amount: 0, label: "0", unset: null } }],
+    };
+    const draft = {
+      schema_version: "tax-draft-input.v1",
+      kind: "vat_purchase",
+      context: { jurisdiction: "KR", book_state: "raw", assumptions: ["0"], future_field: null },
+      rows: [{ row_id: "row-a", supply_amount: "0", vat_amount: null, nested: { amount: 0, text: "0", missing: null } }],
+    };
+    const { tools } = await client.listTools();
+    const tool = tools.find((item) => item.name === "tax_create_draft_bundle");
+    assert.deepEqual(tool.inputSchema.required?.slice().sort(), ["draft", "matter"]);
+    assert.equal(tool.annotations.readOnlyHint, true);
+    assert.equal(tool.annotations.openWorldHint, false);
+
+    const result = await client.callTool({ name: "tax_create_draft_bundle", arguments: { matter, draft } });
+    assert.deepEqual(result.structuredContent, { status: "accepted" });
+    assert.deepEqual(JSON.parse(result.content[0].text), { status: "accepted" });
+    assert.deepEqual(calls, [["create_tax_draft_bundle", { matter, draft }]],
+      "the bridge must preserve every nested string, null, and zero without adding options");
+  } finally {
+    await client.close();
+  }
 });
 
 test("lecture and personal-service calculation facts pass through unchanged with a bounded evidence scope", async () => {
@@ -420,6 +480,25 @@ test("lookup basis schema compatibility accepts old upper with new child but rej
   await assert.rejects(
     () => discoverAndVerifyTools(childWithOldSchema, [newContract], 1000),
     (error) => error?.code === "DOMAIN_SCHEMA_MISMATCH",
+  );
+});
+
+test("new route and health tools are required child contracts", async () => {
+  const schemaSource = new McpServer({ name: "tax-contract-source", version: "0" });
+  const contracts = registerTaxDomainTools(schemaSource, {
+    setStatusListener() {},
+    async callToolResult() { return { content: [{ type: "text", text: "{}" }], structuredContent: {} }; },
+  }).contracts;
+  const newContracts = contracts.filter((item) => ["route_tax_question", "health"].includes(item.domainName));
+  assert.equal(newContracts.length, 2);
+  const oldChild = {
+    async listTools() {
+      return { tools: contracts.filter((item) => !newContracts.includes(item)).map(({ domainName, inputSchema }) => ({ name: domainName, inputSchema })) };
+    },
+  };
+  await assert.rejects(
+    () => discoverAndVerifyTools(oldChild, contracts, 1000),
+    (error) => error?.code === "DOMAIN_TOOL_MISSING",
   );
 });
 
@@ -791,6 +870,12 @@ test("practitioner bridge errors pass through without answer projection", async 
 const FAKE = join(dirname(fileURLToPath(import.meta.url)), "fixtures", "fake-child.mjs");
 const FAKE_TOOL_NAMES = ["ping", "crash", "sleep", "env_check", "fail"];
 const FAKE_CONTRACTS = genericContracts(FAKE_TOOL_NAMES);
+const draftSchemaSource = new McpServer({ name: "tax-draft-contract-source", version: "0" });
+const DRAFT_BUNDLE_CONTRACT = registerTaxDomainTools(draftSchemaSource, {
+  setStatusListener() {},
+  async callToolResult() { return { content: [{ type: "text", text: "{}" }], structuredContent: {} }; },
+}).contracts.find((contract) => contract.domainName === "create_tax_draft_bundle");
+assert.ok(DRAFT_BUNDLE_CONTRACT, "the draft bundle contract should be registered");
 const fake = async (log, extra = {}, env = { PATH: process.env.PATH }) => {
   const client = new TaxDomainClient({ command: process.execPath, args: log ? [FAKE, log] : [FAKE], ...extra }, env);
   await client.initialize(FAKE_CONTRACTS);
@@ -798,6 +883,25 @@ const fake = async (log, extra = {}, env = { PATH: process.env.PATH }) => {
 };
 const logPath = () => join(mkdtempSync(join(tmpdir(), "taxbridge-")), "pids.log");
 const pids = (p) => readFileSync(p, "utf8").split("\n").filter(Boolean);
+
+test("fake child verifies and returns the native draft bundle call without changing nested values", async () => {
+  const client = new TaxDomainClient({ command: process.execPath, args: [FAKE] }, { PATH: process.env.PATH });
+  const args = {
+    matter: { matter_id: "fake-matter", facts: { amount: 0, amount_text: "0", optional: null } },
+    draft: { schema_version: "tax-draft-input.v1", kind: "vat_purchase",
+      context: { assumptions: ["0"], nested: { amount: 0, label: "0", missing: null } },
+      rows: [{ row_id: "row-a", supply_amount: "0", vat_amount: null }] },
+  };
+  try {
+    await client.initialize([...FAKE_CONTRACTS, DRAFT_BUNDLE_CONTRACT]);
+    const result = await client.callToolResult("create_tax_draft_bundle", args);
+    const expected = { name: "create_tax_draft_bundle", args };
+    assert.deepEqual(result.structuredContent, expected);
+    assert.deepEqual(JSON.parse(result.content[0].text), expected);
+  } finally {
+    await client.close();
+  }
+});
 
 test("reconnects after child crash", async () => {
   const log = logPath();
@@ -844,14 +948,66 @@ test("child isError -> TAX_DOMAIN_TOOL_ERROR with fixed safe message", async () 
   await c.close();
 });
 
-test("timeout returns TAX_DOMAIN_TIMEOUT and does not reset the shared child", async () => {
+test("timeout returns TAX_DOMAIN_TIMEOUT and does not reset the shared child", { timeout: 25_000 }, async () => {
   const log = logPath();
-  const c = await fake(log, { timeoutMs: 300 });
-  const r0 = await c.callTool("ping", {});
-  const t = await c.callTool("sleep", {});
-  assert.equal(t.error_code, "TAX_DOMAIN_TIMEOUT");
-  const r1 = await c.callTool("ping", {});
-  assert.equal(r1.pid, r0.pid);
-  assert.equal(pids(log).length, 1);
-  await c.close();
+  const c = new TaxDomainClient(
+    { command: process.execPath, args: [FAKE, log], timeoutMs: 3_000 },
+    { PATH: process.env.PATH },
+  );
+  const assertSingleStartup = (pid) => {
+    const rows = pids(log);
+    assert.equal(rows.length, 1);
+    assert.equal(Number(rows[0].trim().split(/\s+/)[0]), pid);
+  };
+  try {
+    await c.initialize(FAKE_CONTRACTS);
+    assert.equal(c.getStatus().state, "ready");
+
+    const r0 = await c.callTool("ping", {});
+    assert.ok(Number.isInteger(r0.pid) && r0.pid > 0);
+    assertSingleStartup(r0.pid);
+
+    const t = await c.callTool("sleep", {});
+    assert.equal(t.schema_version, "tax-bridge-error.v1");
+    assert.equal(t.error_code, "TAX_DOMAIN_TIMEOUT");
+    assert.equal(c.getStatus().state, "ready");
+    assertSingleStartup(r0.pid);
+
+    const r1 = await c.callTool("ping", {});
+    assert.ok(Number.isInteger(r1.pid) && r1.pid > 0);
+    assert.equal(r1.pid, r0.pid);
+    assertSingleStartup(r1.pid);
+  } finally {
+    await c.close();
+  }
+});
+
+test("connect failure eager close and domain shutdown share one awaited transport close", { timeout: 10_000 }, async () => {
+  const originalClose = StdioClientTransport.prototype.close;
+  let closeCalls = 0;
+  let releaseGate;
+  const gate = new Promise(resolve => { releaseGate = resolve; });
+  StdioClientTransport.prototype.close = function (...args) {
+    closeCalls++;
+    return gate.then(() => originalClose.apply(this, args));
+  };
+  const domain = new TaxDomainClient({ command: "missing-tax-child-command", args: [], timeoutMs: 1_000 }, { PATH: process.env.PATH });
+  let initializing;
+  let closing;
+  try {
+    initializing = domain.initialize(FAKE_CONTRACTS);
+    const deadline = Date.now() + 3_000;
+    while (closeCalls === 0 && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 10));
+    assert.equal(closeCalls, 1, "the SDK eager close enters the owned transport close once");
+
+    let closeSettled = false;
+    closing = domain.close().then(() => { closeSettled = true; });
+    await new Promise(resolve => setTimeout(resolve, 30));
+    assert.equal(closeCalls, 1, "domain shutdown reuses the eager transport close");
+    assert.equal(closeSettled, false, "domain shutdown waits for that close to finish");
+  } finally {
+    StdioClientTransport.prototype.close = originalClose;
+    releaseGate();
+    await Promise.allSettled([initializing, closing].filter(Boolean));
+  }
 });

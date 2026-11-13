@@ -221,6 +221,12 @@ export class TaxDomainClient implements TaxDomainClientLike {
       env: childEnv(this.config, this.env),
       stderr: "ignore",
     });
+    const originalTransportClose = transport.close.bind(transport);
+    let transportClosePromise: Promise<void> | undefined;
+    transport.close = (): Promise<void> => {
+      if (!transportClosePromise) transportClosePromise = Promise.resolve().then(originalTransportClose);
+      return transportClosePromise;
+    };
     const client = new Client({ name: "agentlink-tax-bridge", version: "0.1.0" });
     const abort = new AbortController();
     const pending = { client, transport, abort, id };

@@ -40,9 +40,20 @@ function validPayload(args: Record<string, unknown>, rootDepth = 0): boolean {
   catch { return false; }
 }
 const unknownPayload = z.unknown().superRefine((value, ctx) => {
-  if (!validPayload({ value }, 1)) ctx.addIssue({ code: z.ZodIssueCode.custom, message: "Invalid nested payload." });
+  if (!validPayload({ value }, 1)) ctx.addIssue({ code: "custom", message: "Invalid nested payload." });
 });
 const recordKey = z.string().refine(wellFormed);
+const rejectOwnProtoKey = <T extends z.ZodType>(schema: T) => {
+  const metadata = toJsonSchemaCompat(schema, { pipeStrategy: "input" });
+  delete metadata.$schema;
+  return z.preprocess((value, ctx) => {
+    if (value !== null && typeof value === "object" && Object.prototype.propertyIsEnumerable.call(value, "__proto__")) {
+      ctx.addIssue({ code: "custom", message: "Invalid nested payload." });
+      return z.NEVER;
+    }
+    return value;
+  }, schema).meta(metadata);
+};
 
 // Python len(str) counts Unicode code points, unlike JavaScript string.length.
 const text = (max: number, min = 0) => z.string().refine(
@@ -57,18 +68,18 @@ const date = z.string().refine((v) => {
   const leap = y % 4 === 0 && (y % 100 !== 0 || y % 400 === 0);
   return y >= 1 && m >= 1 && m <= 12 && d >= 1 && d <= [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m - 1];
 }, { message: "Expected an ISO calendar date (YYYY-MM-DD)." });
-const nullable = <T extends z.ZodTypeAny>(schema: T) => schema.nullable().optional();
+const nullable = <T extends z.ZodType>(schema: T) => schema.nullable().optional();
 const regime = z.enum(["subsidy", "local_gov_subsidy", "national_rnd", "sme_support_general"]);
 const context = z.object({
   task: nullable(z.enum(["labor", "travel", "purchasing", "plan_change", "settlement"])),
   role: nullable(z.enum(["applicant", "official", "reviewer", "compliance", "fund_manager", "accountant", "taxpayer", "tax_practitioner"])),
   ministry: nullable(text(100)), project: nullable(text(200)), as_of: nullable(date),
   funding_scheme: nullable(z.enum(["national", "local"])), domain: nullable(text(80)), workflow: nullable(text(100)),
-  facts: z.record(recordKey, z.string().refine(wellFormed)).optional(),
+  facts: rejectOwnProtoKey(z.record(recordKey, z.string().refine(wellFormed))).optional(),
 }).strict();
 const limit = z.number().int().min(1).max(20).default(8);
-const facts = z.record(full("[a-z][a-z0-9_]*").refine(wellFormed), text(100)).refine((v) => Object.keys(v).length <= 20,
-  { message: "Expected at most 20 fact entries." });
+const facts = rejectOwnProtoKey(z.record(full("[a-z][a-z0-9_]*").refine(wellFormed), text(100)).refine((v) => Object.keys(v).length <= 20,
+  { message: "Expected at most 20 fact entries." }));
 // Python str.strip whitespace (FEFF is deliberately not included).
 const pythonBlank = /^[\u0009-\u000d\u001c-\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]*(?![\s\S])/u;
 
@@ -103,7 +114,7 @@ export function registerSubsidyDomainTools(server: McpServer, client: SubsidyDom
   };
   reg("list_workflows", "List subsidy/R&D workflows and context fields.", {});
   reg("get_reference_bundle", "Get reference candidates, drafting templates and missing context.", {
-    query: text(2000, 1), context, limit, matter: nullable(z.record(recordKey, unknownPayload)),
+    query: text(2000, 1), context, limit, matter: nullable(rejectOwnProtoKey(z.record(recordKey, unknownPayload))),
   });
   reg("search_references", "Search stored regulation excerpts; matches are candidates.", {
     query: text(2000, 1), context: nullable(context), limit,
@@ -113,7 +124,7 @@ export function registerSubsidyDomainTools(server: McpServer, client: SubsidyDom
     question: text(500, 1), perspective: nullable(z.enum(["recipient", "verifier"])), regime: nullable(regime),
     stage: nullable(text(80)), as_of: nullable(date), facts: nullable(facts),
     need_id: nullable(text(120).and(full("pn\\.[a-z_]+\\.[a-z_]+\\.\\p{Decimal_Number}{2}"))),
-    conversation_state: nullable(z.record(recordKey, unknownPayload)), followed_action_id: nullable(full("na\\.[0-9]{2}")),
+    conversation_state: nullable(rejectOwnProtoKey(z.record(recordKey, unknownPayload))), followed_action_id: nullable(full("na\\.[0-9]{2}")),
   });
   reg("list_practitioner_topics", "List practitioner topics and linked cards.", {
     regime: nullable(regime), include_uncarded: z.boolean().default(false),
