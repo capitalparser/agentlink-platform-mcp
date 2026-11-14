@@ -1012,14 +1012,17 @@ test("concurrent first calls spawn one child", async () => {
 
 test("env allowlist: non-allowlisted vars are not passed, allowlisted are", async () => {
   const offerPath = "/tmp/automation-offer.json";
+  const profilePath = "/tmp/owned-invoice-profile.json";
   const c = await fake(null, {}, {
     PATH: process.env.PATH, FOO_SECRET: "x", HTTPS_PROXY: "http://p:1",
     AGENTLINK_AUTOMATION_OFFER_PATH: offerPath,
+    AGENTLINK_TAX_INVOICE_PROFILE: profilePath,
   });
   const r = await c.callTool("env_check", {});
   assert.equal(r.has_secret, false);
   assert.equal(r.has_proxy, true);
   assert.equal(r.automation_offer_path, offerPath);
+  assert.equal(r.tax_invoice_profile, profilePath);
   await c.close();
 });
 

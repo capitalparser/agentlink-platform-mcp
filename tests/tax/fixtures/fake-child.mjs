@@ -54,6 +54,7 @@ server.tool('env_check', 'env', {}, async () => ok({
   has_secret: process.env.FOO_SECRET !== undefined,
   has_proxy: process.env.HTTPS_PROXY !== undefined,
   automation_offer_path: process.env.AGENTLINK_AUTOMATION_OFFER_PATH,
+  tax_invoice_profile: process.env.AGENTLINK_TAX_INVOICE_PROFILE,
 }));
 server.tool('fail', 'fail', {}, async () => ({
   isError: true,

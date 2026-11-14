@@ -169,3 +169,62 @@ test('list pagination shares one deadline and aborts an unresponsive page', asyn
     (error) => error instanceof DiscoveryFailure && error.code === 'DOMAIN_TIMEOUT');
   assert.ok(Date.now() - started < 500);
 });
+
+const capabilitySchema = {
+  type: 'object',
+  properties: { token: { type: 'string', pattern: '^[A-Za-z0-9_-]{1,64}$' } },
+  required: ['token'],
+  additionalProperties: false,
+};
+const capabilityAnnotations = {
+  readOnlyHint: false,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: true,
+};
+const optionalCapabilityContract = {
+  publicName: 'tax_optional_lookup',
+  domainName: 'optional_lookup',
+  inputSchema: capabilitySchema,
+  optional: true,
+  expectedAnnotations: capabilityAnnotations,
+};
+
+test('optional capabilities are verified individually while required tools remain available', async () => {
+  const requiredContract = { ...contracts[0], publicName: 'tax_plan', domainName: 'plan_tax' };
+  const verified = await discoverAndVerifyTools(paged({ first: { tools: [
+    { name: 'plan_tax', inputSchema: childSchema },
+    { name: 'optional_lookup', inputSchema: capabilitySchema, annotations: capabilityAnnotations },
+  ] } }), [requiredContract, optionalCapabilityContract], 1000);
+  assert.deepEqual([...verified.keys()], ['plan_tax', 'optional_lookup']);
+});
+
+test('protocol-valid optional schema and annotation mismatches do not invalidate required tools', async () => {
+  const requiredContract = { ...contracts[0], publicName: 'tax_plan', domainName: 'plan_tax' };
+  const tools = [
+    { name: 'plan_tax', inputSchema: childSchema },
+    { name: 'optional_lookup', inputSchema: { ...capabilitySchema, required: [] }, annotations: capabilityAnnotations },
+    { name: 'optional_status', inputSchema: capabilitySchema, annotations: { ...capabilityAnnotations, readOnlyHint: true } },
+    { name: 'optional_extra', inputSchema: capabilitySchema, annotations: { ...capabilityAnnotations, title: 'unexpected' } },
+  ];
+  const optionalContracts = [
+    optionalCapabilityContract,
+    { ...optionalCapabilityContract, publicName: 'tax_optional_status', domainName: 'optional_status' },
+    { ...optionalCapabilityContract, publicName: 'tax_optional_extra', domainName: 'optional_extra' },
+  ];
+  const verified = await discoverAndVerifyTools(paged({ first: { tools } }), [requiredContract, ...optionalContracts], 1000);
+  assert.deepEqual([...verified.keys()], ['plan_tax']);
+});
+
+test('required missing or mismatched tools still fail closed when optional tools are present', async () => {
+  const requiredContract = { ...contracts[0], publicName: 'tax_plan', domainName: 'plan_tax' };
+  await assert.rejects(discoverAndVerifyTools(paged({ first: { tools: [
+    { name: 'optional_lookup', inputSchema: capabilitySchema, annotations: capabilityAnnotations },
+  ] } }), [requiredContract, optionalCapabilityContract], 1000),
+  (error) => error instanceof DiscoveryFailure && error.code === 'DOMAIN_TOOL_MISSING');
+  await assert.rejects(discoverAndVerifyTools(paged({ first: { tools: [
+    { name: 'plan_tax', inputSchema: { ...childSchema, required: ['amount'] } },
+    { name: 'optional_lookup', inputSchema: capabilitySchema, annotations: capabilityAnnotations },
+  ] } }), [requiredContract, optionalCapabilityContract], 1000),
+  (error) => error instanceof DiscoveryFailure && error.code === 'DOMAIN_SCHEMA_MISMATCH');
+});
