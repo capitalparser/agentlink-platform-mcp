@@ -1,7 +1,7 @@
 /**
  * Tax domain tools (세무 도메인 도구) bridged to agentlink-domain-tax-mcp.
- * All tools are read-only. Selected lecture and personal-service payments can
- * include scoped withholding calculations when supplied facts and current-law evidence pass.
+ * Existing practitioner tools are read-only. Optional owned-invoice tools are
+ * registered separately and are enabled only when their exact child contracts pass discovery.
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -13,6 +13,7 @@ import type { TaxDomainClientLike } from "./bridge.js";
 import { bridgeError, isBridgeError } from "./bridge.js";
 import type { ToolContract } from "../discovery.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { registerInvoiceTools } from "./invoice-tools.js";
 
 const NOTICE =
   " Results are review drafts. Per-payment withholding calculations are limited to explicitly selected business_lecture, other_lecture, business_personal_service, and other_personal_service profiles when complete user facts and matched current-law evidence are available; whole-matter applicability remains not_determined. The other_personal_service profile covers only three user-confirmed temporary payment types: manuscript_fee is 원고료 paid to the original author of a qualifying creative work under Article 21(1)(15)(a), not an 인세 royalty under (b) or a creative-work sale or other consideration under (c); expert_advisory is temporary paid use of professional knowledge or special skill under Article 21(1)(19)(c), excluding services under (15)–(17) and receipts of a professional practice or continuing business; broadcast_commentary is temporary explanation, enlightenment, or acting judging through radio, television, or analogous broadcasting media under Article 21(1)(19)(b), not generic committee judging, online content, performances, or consulting. For all three, the user must assert that the receipt is outside the other listed income types, professional-practice or continuing-business revenue, royalties, license fees, rights transfers or use, and inseparable mixed consideration; a one-off payment does not establish that classification. For the supported OTHER profiles, the statute permits actual necessary expenses above the 60% standard allowance, including an amount above gross. The calculator can use a user-supplied whole-won total only when the user confirms that it corresponds to this payment's current-period receipts, is ordinary and deductible, exceeds the 60% standard amount, is supported by records the payer can ascertain, and is within the existing 1,000,000,000,000,000-won input limit. This is an unverified user assertion: the calculator has not inspected or authenticated records and does not resolve allocation, depreciation, statutory limits, timing, duplication, or reimbursement questions. Computed actual rows use expense_method=actual, place the total in expense_amount, set expense_rate to null, and report any amount above gross separately as expense_excess_amount. When the signed payment-level OTHER difference is negative, the result keeps that negative value in income_amount, uses a zero withholding base and zero withholding for that payment, and leaves net_payment at gross. This payment-level calculation does not compute annual OTHER-income netting, cross-income offsets, loss carryforward, or refunds, and does not decide eligibility for them. The user-provided classifications remain unverified. The personal-service profile covers only these explicitly selected continuing independent services: authorship (저술 용역), artwork_design (도안 용역), illustration (삽화 용역), composition (작곡 용역), voice_acting (성우 용역), entertainment_direction (연예에 관한 연출 용역), entertainment_filming (연예에 관한 촬영 용역), proofreading (교정 용역), translation (번역 용역), and shorthand (속기 용역). Facts and calculations remain pending review, and no filing decision or submission is issued." +
@@ -293,8 +294,16 @@ export function registerTaxDomainTools(server: McpServer, client: TaxDomainClien
       limit: z.number().int().min(1).max(50).default(20).describe("Max tips (1-50)"),
     });
 
+  const invoiceTools = registerInvoiceTools(server, client);
+  const allContracts = [...contracts, ...invoiceTools.contracts];
+  const allHandles = [...handles, ...invoiceTools.handles];
+
   client.setStatusListener((status) => {
     for (const handle of handles) status.state === "ready" ? handle.enable() : handle.disable();
+    invoiceTools.handles.forEach((handle, index) => {
+      const verified = status.state === "ready" && status.verified_tool_names.includes(invoiceTools.contracts[index].publicName);
+      verified ? handle.enable() : handle.disable();
+    });
   });
-  return { contracts, handles };
+  return { contracts: allContracts, handles: allHandles };
 }

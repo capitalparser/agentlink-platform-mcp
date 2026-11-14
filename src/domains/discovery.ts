@@ -4,11 +4,19 @@ export interface ToolContract {
   publicName: string;
   domainName: string;
   inputSchema: Record<string, unknown>;
+  optional?: boolean;
+  expectedAnnotations?: {
+    readOnlyHint: boolean;
+    destructiveHint: boolean;
+    idempotentHint: boolean;
+    openWorldHint: boolean;
+  };
 }
 
 export interface ListedTool {
   name: string;
   inputSchema: Record<string, unknown>;
+  annotations?: unknown;
 }
 
 export interface DiscoveryClient {
@@ -434,6 +442,7 @@ export async function discoverAndVerifyTools(
   const abort = new AbortController();
   const timer = setTimeout(() => abort.abort(), timeoutMs);
   const byName = new Map<string, ListedTool>();
+  const optionalNames = new Set(contracts.filter((contract) => contract.optional).map((contract) => contract.domainName));
   const cursors = new Set<string>();
   let cursor: string | undefined;
   let bytes = 0;
@@ -451,11 +460,18 @@ export async function discoverAndVerifyTools(
       bytes += jsonBytes(result);
       if (bytes > MAX_BYTES || !isRecord(result) || !Array.isArray(result.tools)) throw new DiscoveryFailure("DOMAIN_SCHEMA_MISMATCH");
       for (const candidate of result.tools) {
-        if (!isRecord(candidate) || typeof candidate.name !== "string" || candidate.name.length === 0 || !isRecord(candidate.inputSchema)) {
+        if (!isRecord(candidate) || typeof candidate.name !== "string" || candidate.name.length === 0) {
           throw new DiscoveryFailure("DOMAIN_SCHEMA_MISMATCH");
         }
         if (byName.has(candidate.name)) throw new DiscoveryFailure("DOMAIN_SCHEMA_MISMATCH");
-        byName.set(candidate.name, { name: candidate.name, inputSchema: candidate.inputSchema });
+        if (!isRecord(candidate.inputSchema) && !optionalNames.has(candidate.name)) {
+          throw new DiscoveryFailure("DOMAIN_SCHEMA_MISMATCH");
+        }
+        byName.set(candidate.name, {
+          name: candidate.name,
+          inputSchema: isRecord(candidate.inputSchema) ? candidate.inputSchema : {},
+          ...(Object.hasOwn(candidate, "annotations") ? { annotations: candidate.annotations } : {}),
+        });
         if (byName.size > MAX_TOOLS) throw new DiscoveryFailure("DOMAIN_SCHEMA_MISMATCH");
       }
       if (result.nextCursor === undefined) break;
@@ -473,8 +489,22 @@ export async function discoverAndVerifyTools(
   const verified = new Map<string, ListedTool>();
   for (const contract of contracts) {
     const child = byName.get(contract.domainName);
-    if (!child) throw new DiscoveryFailure("DOMAIN_TOOL_MISSING");
-    if (!inputSchemasCompatible(contract.inputSchema, child.inputSchema)) throw new DiscoveryFailure("DOMAIN_SCHEMA_MISMATCH");
+    if (!child) {
+      if (contract.optional) continue;
+      throw new DiscoveryFailure("DOMAIN_TOOL_MISSING");
+    }
+    const expectedAnnotations = contract.expectedAnnotations === undefined
+      ? undefined
+      : Object.entries(contract.expectedAnnotations);
+    const childAnnotations = isRecord(child.annotations) ? child.annotations : undefined;
+    const annotationsMatch = expectedAnnotations === undefined ||
+      (childAnnotations !== undefined && Object.keys(childAnnotations).length === expectedAnnotations.length &&
+        expectedAnnotations.every(([key, value]) => childAnnotations[key] === value));
+    const schemaMatches = inputSchemasCompatible(contract.inputSchema, child.inputSchema);
+    if (!schemaMatches || !annotationsMatch) {
+      if (contract.optional) continue;
+      throw new DiscoveryFailure("DOMAIN_SCHEMA_MISMATCH");
+    }
     verified.set(contract.domainName, child);
   }
   return verified;
