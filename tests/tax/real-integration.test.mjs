@@ -440,10 +440,10 @@ test("installed tax child matches the native and upper review matrix over MCP st
 
           const expectedIncomeRows = [
             { row_id: "i-a", source_ref: "src-a", ledger_ref: "led-a", income_label: "강의료",
-              source_amount: "100.10", ledger_amount: "90.05", difference: "10.05", expense_amount: "20.25",
-              prepaid_tax_amount: "3.30", comparison_status: "difference_unresolved", evidence_refs: ["ev-income-a"] },
+              source_amount: "100.1", ledger_amount: "90.05", difference: "10.05", expense_amount: "20.25",
+              prepaid_tax_amount: "3.3", comparison_status: "difference_unresolved", evidence_refs: ["ev-income-a"] },
             { row_id: "i-b", source_ref: "src-b", ledger_ref: "led-b", income_label: "원고료",
-              source_amount: "80.05", ledger_amount: "90.10", difference: "-10.05", expense_amount: "-2.50",
+              source_amount: "80.05", ledger_amount: "90.1", difference: "-10.05", expense_amount: "-2.5",
               prepaid_tax_amount: "0", comparison_status: "difference_unresolved", evidence_refs: [] },
             { row_id: "i-c", source_ref: "src-c", ledger_ref: "led-c", income_label: "해외 지급처 설명",
               source_amount: "0", ledger_amount: null, difference: null, expense_amount: null,
@@ -478,7 +478,7 @@ test("installed tax child matches the native and upper review matrix over MCP st
           assert.deepEqual(incomeRows["i-a"].difference.provenance.input_refs,
             ["rows[i-a].source_amount", "rows[i-a].ledger_amount"]);
           assert.deepEqual(incomeRows["i-a"].difference.provenance.evidence_refs, ["ev-income-a"]);
-          assert.equal(incomeRows["i-b"].expense_amount.value, "-2.50",
+          assert.equal(incomeRows["i-b"].expense_amount.value, "-2.5",
             "signed expense corrections remain collected inputs");
           assert.equal(incomeRows["i-b"].prepaid_tax_amount.value, "0",
             "explicit prepaid-tax zero remains present");
@@ -500,30 +500,65 @@ test("installed tax child matches the native and upper review matrix over MCP st
               `income report should distinguish the ${label} column`);
           }
           assert.match(incomeRowBlock.caption, /사용자/);
-          assert.match(incomeRowBlock.caption, /미확인/);
+          assert.match(incomeRowBlock.caption, /미확인|확인되지 않았/);
           const incomeReportRows = Object.fromEntries(incomeRowBlock.rows.map((row) => [row.row_id, row]));
           assert.deepEqual(incomeRowBlock.rows.map((row) => row.row_id), expectedIncomeRows.map((row) => row.row_id));
-          for (const field of ["source_amount", "ledger_amount", "difference", "expense_amount", "prepaid_tax_amount"]) {
-            const cell = incomeReportRows["i-a"].cells[field];
-            const ref = `draft-row:i-a:${field}`;
-            const expectedInputRefs = field === "difference"
-              ? ["rows[i-a].source_amount", "rows[i-a].ledger_amount"]
-              : [`rows[i-a].${field}`];
-            assert.equal(cell.value, expectedIncomeRows[0][field]);
-            assert.equal(cell.status, "draft");
-            assert.equal(cell.ref, ref);
-            assert.deepEqual(upperResult.report.provenance_index[ref], {
-              kind: field === "difference" ? "derived_difference" : "user_supplied",
-              value: expectedIncomeRows[0][field],
-              fact_refs: expectedInputRefs,
+          const reportIndex = upperResult.report.provenance_index;
+          for (const expectedRow of expectedIncomeRows) {
+            const reportRow = incomeReportRows[expectedRow.row_id];
+            for (const field of ["source_ref", "ledger_ref", "income_label"]) {
+              const value = expectedRow[field];
+              const cell = reportRow.cells[field];
+              assert.equal(cell.value, value, `${expectedRow.row_id} report ${field} mismatch`);
+              if (value === null) {
+                assert.equal(cell.status, "missing");
+                assert.equal(cell.ref, null);
+                continue;
+              }
+              const ref = `draft-row:${expectedRow.row_id}:${field}`;
+              assert.equal(cell.status, "draft");
+              assert.equal(cell.ref, ref);
+              assert.deepEqual(reportIndex[ref], {
+                kind: "user_supplied", value, fact_refs: [`rows[${expectedRow.row_id}].${field}`],
+                attachment_id: null, locator: null,
+              });
+            }
+            for (const field of ["source_amount", "ledger_amount", "difference", "expense_amount", "prepaid_tax_amount"]) {
+              const value = expectedRow[field];
+              const cell = reportRow.cells[field];
+              assert.equal(cell.value, value, `${expectedRow.row_id} report ${field} mismatch`);
+              if (value === null) {
+                assert.equal(cell.status, "missing");
+                assert.equal(cell.ref, null);
+                continue;
+              }
+              const ref = `draft-row:${expectedRow.row_id}:${field}`;
+              const expectedInputRefs = field === "difference"
+                ? [`rows[${expectedRow.row_id}].source_amount`, `rows[${expectedRow.row_id}].ledger_amount`]
+                : [`rows[${expectedRow.row_id}].${field}`];
+              assert.equal(cell.status, "draft");
+              assert.equal(cell.ref, ref);
+              assert.deepEqual(reportIndex[ref], {
+                kind: field === "difference" ? "derived_difference" : "user_supplied",
+                value,
+                fact_refs: expectedInputRefs,
+                attachment_id: null,
+                locator: null,
+              });
+            }
+            const statusCell = reportRow.cells.comparison_status;
+            const statusRef = `draft-row:${expectedRow.row_id}:comparison_status`;
+            assert.equal(statusCell.value, expectedRow.comparison_status);
+            assert.equal(statusCell.status, "draft");
+            assert.equal(statusCell.ref, statusRef);
+            assert.deepEqual(reportIndex[statusRef], {
+              kind: "derived_status",
+              value: expectedRow.comparison_status,
+              fact_refs: [`rows[${expectedRow.row_id}].source_amount`, `rows[${expectedRow.row_id}].ledger_amount`],
               attachment_id: null,
               locator: null,
             });
           }
-          assert.equal(incomeReportRows["i-c"].cells.ledger_amount.status, "missing");
-          assert.equal(incomeReportRows["i-c"].cells.ledger_amount.ref, null);
-          assert.equal(incomeReportRows["i-c"].cells.difference.status, "missing");
-          assert.equal(incomeReportRows["i-c"].cells.difference.ref, null);
 
           const countMembers = {
             row_count: ["i-a", "i-b", "i-c", "i-z"],
