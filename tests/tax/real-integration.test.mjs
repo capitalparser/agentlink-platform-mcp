@@ -27,6 +27,7 @@ const STDERR_LIMIT = 8 * 1024;
 const DRAFT_FIXTURES = [
   "draft-vat.json",
   "draft-corporate.json",
+  "draft-income.json",
   "draft-withholding.json",
   "expected.json",
 ];
@@ -117,6 +118,14 @@ function assertDraftExports(result) {
   assert.deepEqual(exported.report, result.report, "draft.json must preserve the common report");
   const csv = parseCsv(csvExport.text);
   return { csvHeaders: csv.headers, csvRows: csv.rows, csvText: csvExport.text };
+}
+
+function reportBlock(result, sectionId, blockId) {
+  const section = result.report.sections.find((item) => item.section_id === sectionId);
+  assert.ok(section, `missing ${sectionId} report section`);
+  const block = section.blocks.find((item) => item.block_id === blockId);
+  assert.ok(block, `missing ${blockId} report block`);
+  return block;
 }
 
 function payment(overrides = {}) {
@@ -301,6 +310,7 @@ test("installed tax child matches the native and upper review matrix over MCP st
       const fixtureInputs = [
         ["vat", readDraftFixture("draft-vat.json")],
         ["corporate", readDraftFixture("draft-corporate.json")],
+        ["income", readDraftFixture("draft-income.json")],
         ["withholding", readDraftFixture("draft-withholding.json")],
       ];
       const expected = readDraftFixture("expected.json");
@@ -392,6 +402,254 @@ test("installed tax child matches the native and upper review matrix over MCP st
           assert.equal(corporateSummary.absolute_difference_sum.summary_value,
             expected.corporate.absolute_difference_sum);
           assert.equal(corporateSummary.absolute_difference_sum.contributing_row_ids, "c-a;c-b;c-z");
+        } else if (caseName === "income") {
+          const expectedIncome = {
+            row_count: 4,
+            comparable_count: 3,
+            incomplete_count: 1,
+            nonzero_difference_count: 2,
+            review_status: "incomplete",
+            differences_unresolved: true,
+            amount_completeness: {
+              source_amount: { supplied_count: 4, missing_count: 0 },
+              ledger_amount: { supplied_count: 3, missing_count: 1 },
+              expense_amount: { supplied_count: 3, missing_count: 1 },
+              prepaid_tax_amount: { supplied_count: 3, missing_count: 1 },
+            },
+            row_differences: ["10.05", "-10.05", null, "0"],
+          };
+          assert.deepEqual(expected.income, expectedIncome,
+            "income fixture oracle must independently match the pinned design expectations");
+          assert.equal(upperResult.kind, "income_reconciliation");
+          assert.equal(upperResult.workflow_id, "income-return");
+          assert.equal(upperResult.focus_id, "return-scope");
+          assert.equal(upperResult.draft.population_status, "populated");
+          assert.deepEqual(upperResult.draft.summary, {
+            row_count: expectedIncome.row_count,
+            comparable_count: expectedIncome.comparable_count,
+            incomplete_count: expectedIncome.incomplete_count,
+            nonzero_difference_count: expectedIncome.nonzero_difference_count,
+            review_status: expectedIncome.review_status,
+            differences_unresolved: expectedIncome.differences_unresolved,
+            amount_completeness: expectedIncome.amount_completeness,
+          });
+          assert.deepEqual(Object.keys(upperResult.draft.summary).sort(), [
+            "amount_completeness", "comparable_count", "differences_unresolved", "incomplete_count",
+            "nonzero_difference_count", "review_status", "row_count",
+          ], "income summary must contain counts and statuses only, with no monetary total");
+
+          const expectedIncomeRows = [
+            { row_id: "i-a", source_ref: "src-a", ledger_ref: "led-a", income_label: "강의료",
+              source_amount: "100.1", ledger_amount: "90.05", difference: "10.05", expense_amount: "20.25",
+              prepaid_tax_amount: "3.3", comparison_status: "difference_unresolved", evidence_refs: ["ev-income-a"] },
+            { row_id: "i-b", source_ref: "src-b", ledger_ref: "led-b", income_label: "원고료",
+              source_amount: "80.05", ledger_amount: "90.1", difference: "-10.05", expense_amount: "-2.5",
+              prepaid_tax_amount: "0", comparison_status: "difference_unresolved", evidence_refs: [] },
+            { row_id: "i-c", source_ref: "src-c", ledger_ref: "led-c", income_label: "해외 지급처 설명",
+              source_amount: "0", ledger_amount: null, difference: null, expense_amount: null,
+              prepaid_tax_amount: null, comparison_status: "incomplete", evidence_refs: ["ev-income-a"] },
+            { row_id: "i-z", source_ref: "src-z", ledger_ref: null, income_label: null,
+              source_amount: "0", ledger_amount: "0", difference: "0", expense_amount: "0",
+              prepaid_tax_amount: "0", comparison_status: "equal_unverified", evidence_refs: ["ev-income-a"] },
+          ];
+          const incomeRows = Object.fromEntries(upperResult.draft.rows.map((row) => [row.row_id, row]));
+          assert.deepEqual(upperResult.draft.rows.map((row) => row.row_id),
+            expectedIncomeRows.map((row) => row.row_id), "income rows must preserve fixture order");
+          assert.deepEqual(upperResult.draft.rows.map((row) => row.difference.value), expectedIncome.row_differences);
+          for (const expectedRow of expectedIncomeRows) {
+            const row = incomeRows[expectedRow.row_id];
+            for (const field of ["source_ref", "ledger_ref", "income_label", "comparison_status"]) {
+              assert.equal(row[field], expectedRow[field], `${expectedRow.row_id} ${field} mismatch`);
+            }
+            assert.deepEqual(row.evidence_refs, expectedRow.evidence_refs,
+              `${expectedRow.row_id} evidence IDs must remain user supplied`);
+            for (const field of ["source_amount", "ledger_amount", "difference", "expense_amount", "prepaid_tax_amount"]) {
+              assert.equal(row[field].value, expectedRow[field], `${expectedRow.row_id} ${field} mismatch`);
+              assert.equal(row[field].status, expectedRow[field] === null ? "missing"
+                : field === "difference" ? "derived_arithmetic" : "user_supplied");
+            }
+          }
+          for (const field of ["source_amount", "ledger_amount", "expense_amount", "prepaid_tax_amount"]) {
+            const cell = incomeRows["i-a"][field];
+            assert.deepEqual(cell.provenance.input_refs, [`rows[i-a].${field}`]);
+            assert.deepEqual(cell.provenance.evidence_refs, ["ev-income-a"]);
+          }
+          assert.equal(incomeRows["i-a"].difference.provenance.kind, "derived_difference");
+          assert.deepEqual(incomeRows["i-a"].difference.provenance.input_refs,
+            ["rows[i-a].source_amount", "rows[i-a].ledger_amount"]);
+          assert.deepEqual(incomeRows["i-a"].difference.provenance.evidence_refs, ["ev-income-a"]);
+          assert.equal(incomeRows["i-b"].expense_amount.value, "-2.5",
+            "signed expense corrections remain collected inputs");
+          assert.equal(incomeRows["i-b"].prepaid_tax_amount.value, "0",
+            "explicit prepaid-tax zero remains present");
+          assert.deepEqual(incomeRows["i-b"].expense_amount.provenance.evidence_refs, []);
+          assert.equal(incomeRows["i-c"].difference.provenance.kind, "missing");
+          assert.deepEqual(incomeRows["i-c"].difference.provenance.input_refs,
+            ["rows[i-c].source_amount", "rows[i-c].ledger_amount"]);
+          assert.equal(incomeRows["i-z"].comparison_status, "equal_unverified",
+            "equal zero values do not verify the supplied comparison");
+
+          assert.equal(upperResult.report.report_type, "income_reconciliation_draft");
+          const incomeRowBlock = reportBlock(upperResult, "row_detail", "income-rows");
+          assert.deepEqual(incomeRowBlock.columns.map((column) => column.key), [
+            "source_ref", "ledger_ref", "income_label", "source_amount", "ledger_amount", "difference",
+            "expense_amount", "prepaid_tax_amount", "comparison_status",
+          ]);
+          for (const label of ["자료 금액", "장부 금액", "자료－장부 산술 차이", "제공 경비 금액", "제공 기납부세액"]) {
+            assert.ok(incomeRowBlock.columns.some((column) => column.label === label),
+              `income report should distinguish the ${label} column`);
+          }
+          assert.match(incomeRowBlock.caption, /사용자/);
+          assert.match(incomeRowBlock.caption, /미확인|확인되지 않았/);
+          const incomeReportRows = Object.fromEntries(incomeRowBlock.rows.map((row) => [row.row_id, row]));
+          assert.deepEqual(incomeRowBlock.rows.map((row) => row.row_id), expectedIncomeRows.map((row) => row.row_id));
+          const reportIndex = upperResult.report.provenance_index;
+          for (const expectedRow of expectedIncomeRows) {
+            const reportRow = incomeReportRows[expectedRow.row_id];
+            for (const field of ["source_ref", "ledger_ref", "income_label"]) {
+              const value = expectedRow[field];
+              const cell = reportRow.cells[field];
+              assert.equal(cell.value, value, `${expectedRow.row_id} report ${field} mismatch`);
+              if (value === null) {
+                assert.equal(cell.status, "missing");
+                assert.equal(cell.ref, null);
+                continue;
+              }
+              const ref = `draft-row:${expectedRow.row_id}:${field}`;
+              assert.equal(cell.status, "draft");
+              assert.equal(cell.ref, ref);
+              assert.deepEqual(reportIndex[ref], {
+                kind: "user_supplied", value, fact_refs: [`rows[${expectedRow.row_id}].${field}`],
+                attachment_id: null, locator: null,
+              });
+            }
+            for (const field of ["source_amount", "ledger_amount", "difference", "expense_amount", "prepaid_tax_amount"]) {
+              const value = expectedRow[field];
+              const cell = reportRow.cells[field];
+              assert.equal(cell.value, value, `${expectedRow.row_id} report ${field} mismatch`);
+              if (value === null) {
+                assert.equal(cell.status, "missing");
+                assert.equal(cell.ref, null);
+                continue;
+              }
+              const ref = `draft-row:${expectedRow.row_id}:${field}`;
+              const expectedInputRefs = field === "difference"
+                ? [`rows[${expectedRow.row_id}].source_amount`, `rows[${expectedRow.row_id}].ledger_amount`]
+                : [`rows[${expectedRow.row_id}].${field}`];
+              assert.equal(cell.status, "draft");
+              assert.equal(cell.ref, ref);
+              assert.deepEqual(reportIndex[ref], {
+                kind: field === "difference" ? "derived_difference" : "user_supplied",
+                value,
+                fact_refs: expectedInputRefs,
+                attachment_id: null,
+                locator: null,
+              });
+            }
+            const statusCell = reportRow.cells.comparison_status;
+            const statusRef = `draft-row:${expectedRow.row_id}:comparison_status`;
+            assert.equal(statusCell.value, expectedRow.comparison_status);
+            assert.equal(statusCell.status, "draft");
+            assert.equal(statusCell.ref, statusRef);
+            assert.deepEqual(reportIndex[statusRef], {
+              kind: "derived_status",
+              value: expectedRow.comparison_status,
+              fact_refs: [`rows[${expectedRow.row_id}].source_amount`, `rows[${expectedRow.row_id}].ledger_amount`],
+              attachment_id: null,
+              locator: null,
+            });
+          }
+
+          const countMembers = {
+            row_count: ["i-a", "i-b", "i-c", "i-z"],
+            comparable_count: ["i-a", "i-b", "i-z"],
+            incomplete_count: ["i-c"],
+            nonzero_difference_count: ["i-a", "i-b"],
+          };
+          const amountMembers = {
+            source_amount: { supplied: ["i-a", "i-b", "i-c", "i-z"], missing: [] },
+            ledger_amount: { supplied: ["i-a", "i-b", "i-z"], missing: ["i-c"] },
+            expense_amount: { supplied: ["i-a", "i-b", "i-z"], missing: ["i-c"] },
+            prepaid_tax_amount: { supplied: ["i-a", "i-b", "i-z"], missing: ["i-c"] },
+          };
+          const summarySpecs = [
+            ...Object.entries(countMembers).map(([field, rowIds]) => ({
+              field, value: expectedIncome[field], rowIds,
+              refs: field === "row_count" ? rowIds.map((id) => `rows[${id}].row_id`)
+                : field === "nonzero_difference_count"
+                  ? rowIds.flatMap((id) => [`rows[${id}].source_amount`, `rows[${id}].ledger_amount`])
+                  : rowIds.map((id) => `rows[${id}].row_id`),
+            })),
+            ...Object.entries(amountMembers).flatMap(([field, members]) => [
+              { field: `${field}_supplied_count`, value: expectedIncome.amount_completeness[field].supplied_count,
+                rowIds: members.supplied, refs: members.supplied.map((id) => `rows[${id}].${field}`) },
+              { field: `${field}_missing_count`, value: expectedIncome.amount_completeness[field].missing_count,
+                rowIds: members.missing, refs: members.missing.map((id) => `rows[${id}].${field}`) },
+            ]),
+          ];
+          const incomeSummaryBlock = reportBlock(upperResult, "summary", "income-summary");
+          assert.deepEqual(incomeSummaryBlock.rows.map((row) => row.row_id), summarySpecs.map((spec) => spec.field));
+          assert.match(incomeSummaryBlock.caption, /incomplete/);
+          assert.match(incomeSummaryBlock.caption, /합산/);
+          const incomeReportSummary = Object.fromEntries(incomeSummaryBlock.rows.map((row) => [row.row_id, row]));
+          for (const spec of summarySpecs) {
+            const cell = incomeReportSummary[spec.field].cells.value;
+            const ref = `draft-summary:${spec.field}:value`;
+            assert.equal(cell.value, spec.value, `${spec.field} report count mismatch`);
+            assert.equal(cell.status, "draft");
+            assert.equal(cell.ref, ref);
+            assert.deepEqual(upperResult.report.provenance_index[ref], {
+              kind: "derived_count", value: spec.value, fact_refs: spec.refs, attachment_id: null, locator: null,
+            }, `${spec.field} must retain the expected count contributors`);
+          }
+
+          const { csvHeaders, csvRows, csvText } = assertDraftExports(upperResult);
+          assert.deepEqual(csvHeaders, [
+            "row_kind", "row_id", "source_ref", "ledger_ref", "income_label", "source_amount", "ledger_amount",
+            "difference", "expense_amount", "prepaid_tax_amount", "comparison_status", "evidence_refs",
+            "missing_fields", "review_note", "review_owner", "review", "summary_field", "summary_value",
+            "contributing_row_ids",
+          ]);
+          assert.ok(csvText.includes("\r\n"), "income CSV must use RFC4180 CRLF rows");
+          assert.ok(!csvText.replace(/\r\n/g, "").includes("\n"), "income CSV must not contain bare LF rows");
+          const incomeCsvData = csvRows.filter((row) => row.row_kind === "data");
+          assert.deepEqual(incomeCsvData.map((row) => row.row_id), expectedIncomeRows.map((row) => row.row_id));
+          assert.equal(incomeCsvData.length, 4);
+          const incomeCsvRows = Object.fromEntries(incomeCsvData.map((row) => [row.row_id, row]));
+          for (const expectedRow of expectedIncomeRows) {
+            const row = incomeCsvRows[expectedRow.row_id];
+            for (const field of ["source_ref", "ledger_ref", "income_label", "source_amount", "ledger_amount",
+              "difference", "expense_amount", "prepaid_tax_amount", "comparison_status"]) {
+              assert.equal(row[field], expectedRow[field] ?? "", `${expectedRow.row_id} CSV ${field} mismatch`);
+            }
+          }
+          const missingIncomeFields = incomeCsvRows["i-c"].missing_fields.split(";");
+          for (const field of ["ledger_amount", "difference", "expense_amount", "prepaid_tax_amount"]) {
+            assert.ok(missingIncomeFields.includes(field), `income CSV must identify missing ${field}`);
+          }
+          assert.equal(incomeCsvRows["i-z"].ledger_ref, "");
+          assert.ok(incomeCsvRows["i-z"].missing_fields.split(";").includes("ledger_ref"));
+          for (const field of ["source_amount", "ledger_amount", "difference", "expense_amount", "prepaid_tax_amount"]) {
+            assert.equal(incomeCsvRows["i-z"][field], "0");
+            assert.ok(!incomeCsvRows["i-z"].missing_fields.split(";").includes(field),
+              `explicit zero ${field} must not be marked missing`);
+          }
+          const incomeCsvSummary = csvRows.filter((row) => row.row_kind === "summary");
+          assert.equal(incomeCsvSummary.length, 12);
+          assert.deepEqual(incomeCsvSummary.map((row) => row.summary_field), summarySpecs.map((spec) => spec.field));
+          for (const spec of summarySpecs) {
+            const row = incomeCsvSummary.find((item) => item.summary_field === spec.field);
+            assert.equal(row.summary_value, String(spec.value), `${spec.field} CSV count mismatch`);
+            assert.equal(row.contributing_row_ids, spec.rowIds.join(";"),
+              `${spec.field} CSV members must preserve row order`);
+          }
+          const jsonExport = upperResult.exports.find((item) => item.filename === "draft.json");
+          const jsonBundle = JSON.parse(jsonExport.text);
+          assert.ok(!Object.hasOwn(jsonBundle, "exports"), "draft.json must omit the transport exports key");
+          const { exports: transportExports, ...expectedJsonBundle } = upperResult;
+          assert.equal(transportExports.length, 2);
+          assert.deepEqual(jsonBundle, expectedJsonBundle,
+            "draft.json must preserve the complete result except for its top-level transport exports");
         } else {
           assert.equal(upperResult.kind, "withholding");
           assert.equal(upperResult.workflow_id, "withholding-payment");
@@ -438,6 +696,38 @@ test("installed tax child matches the native and upper review matrix over MCP st
       });
       assert.ok(!Object.hasOwn(upperMalformed, "draft") && !Object.hasOwn(upperMalformed, "exports"),
         "malformed reference errors must not include partial artifacts");
+
+      const incomeFixture = readDraftFixture("draft-income.json");
+      const wrongFocusMatter = structuredClone(incomeFixture.matter);
+      wrongFocusMatter.facts.guidance_focus = "bookkeeping-review";
+      const wrongFocusArgs = { matter: wrongFocusMatter, draft: incomeFixture.draft };
+      const [nativeWrongFocus, upperWrongFocus] = await Promise.all([
+        callNative("create_tax_draft_bundle", wrongFocusArgs),
+        call("tax_create_draft_bundle", wrongFocusArgs),
+      ]);
+      assert.deepEqual(upperWrongFocus, nativeWrongFocus,
+        "unsupported income focus must fail identically across native and upper surfaces");
+      assert.deepEqual(upperWrongFocus, {
+        error: "invalid_input", field: "matter", code: "workflow_mismatch",
+      });
+      assert.ok(!Object.hasOwn(upperWrongFocus, "draft") && !Object.hasOwn(upperWrongFocus, "exports"),
+        "wrong-focus errors must not include partial artifacts");
+
+      const invalidIncomeEvidence = structuredClone(incomeFixture.draft);
+      invalidIncomeEvidence.rows[0].evidence_refs = ["missing-evidence"];
+      const unknownEvidenceArgs = { matter: incomeFixture.matter, draft: invalidIncomeEvidence };
+      const [nativeUnknownIncomeEvidence, upperUnknownIncomeEvidence] = await Promise.all([
+        callNative("create_tax_draft_bundle", unknownEvidenceArgs),
+        call("tax_create_draft_bundle", unknownEvidenceArgs),
+      ]);
+      assert.deepEqual(upperUnknownIncomeEvidence, nativeUnknownIncomeEvidence,
+        "unknown income evidence must fail identically across native and upper surfaces");
+      assert.deepEqual(upperUnknownIncomeEvidence, {
+        error: "invalid_input", field: "draft", code: "invalid_reference",
+      });
+      assert.ok(!Object.hasOwn(upperUnknownIncomeEvidence, "draft")
+        && !Object.hasOwn(upperUnknownIncomeEvidence, "exports"),
+      "unknown-evidence errors must not include partial artifacts");
     }
 
     const plan = (taxMatter) => call("tax_plan_work", { matter: taxMatter, include_evidence: false });

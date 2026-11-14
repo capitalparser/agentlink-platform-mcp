@@ -185,7 +185,7 @@ export function registerTaxDomainTools(server: McpServer, client: TaxDomainClien
     }, true);
 
   reg("tax_create_draft_bundle", "create_tax_draft_bundle",
-    "Create an offline, response-only review bundle from explicitly supplied VAT purchase rows, corporate ledger/return rows, or existing withholding payment facts. Returns pending JSON and CSV workpapers with traceable input values; it does not fetch sources, decide tax treatment, calculate filing liability, persist artifacts, or file (사용자가 명시적으로 제공한 부가세 매입 행·법인 장부/신고 행 또는 기존 원천징수 지급 사실로 오프라인 검토용 번들을 생성합니다. 추적 가능한 입력 값이 포함된 검토 대기 JSON·CSV 작업표를 반환하며 자료 조회, 세무 판단, 신고세액 계산, 저장 또는 신고는 수행하지 않습니다).",
+    "Create an offline, response-only review bundle from explicitly supplied VAT purchase rows, corporate ledger/return rows, user-paired income source and ledger rows with collected expense and prepaid-tax amounts, or existing withholding payment facts. Returns pending JSON and CSV workpapers with traceable input values; income amounts are not aggregated across sources or used for tax computation. It does not fetch sources, decide tax treatment, calculate filing liability, persist artifacts, or file (사용자가 명시적으로 제공한 부가세 매입 행·법인 장부/신고 행·대응 관계를 사용자가 지정한 소득 자료와 장부 행 및 수집 경비·기납부세액 또는 기존 원천징수 지급 사실로 오프라인 검토용 번들을 생성합니다. 추적 가능한 입력 값이 포함된 검토 대기 JSON·CSV 작업표를 반환합니다. 소득 금액을 자료 간 합산하거나 세액 계산에 사용하지 않으며 자료 조회, 세무 판단, 신고세액 계산, 저장 또는 신고는 수행하지 않습니다).",
     {
       matter: z.object({}).passthrough().describe("TaxMatter object used to validate the workflow, period, facts, and evidence references"),
       draft: z.object({}).passthrough().describe("Versioned tax-draft-input.v1 object containing explicit rows or an empty withholding row list"),

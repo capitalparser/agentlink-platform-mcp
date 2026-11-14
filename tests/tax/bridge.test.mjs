@@ -161,6 +161,91 @@ test("draft bundle input preserves nested strings, nulls and zeros through the f
   }
 });
 
+test("income draft bundle payload preserves all nested values through the fake domain bridge", async () => {
+  const calls = [];
+  const fake = { async callTool(name, args) { calls.push([name, args]); return { status: "accepted" }; }, async close() {} };
+  const { client } = await connect(fake);
+  try {
+    const matter = {
+      matter_id: "income-matter",
+      workflow_id: "income-return",
+      as_of: "2026-11-14",
+      period_start: "2026-01-01",
+      period_end: "2026-12-31",
+      taxpayer: { type: "individual", resident: null },
+      facts: { guidance_focus: "return-scope", count: 0, optional: null },
+      evidence: [{
+        id: "ev-income-a",
+        sha256: "a".repeat(64),
+        metadata: { kind: "user_schedule", note: null, amount_text: "0" },
+      }],
+    };
+    const draft = {
+      schema_version: "tax-draft-input.v1",
+      kind: "income_reconciliation",
+      context: {
+        jurisdiction: "KR",
+        book_state: "reported_closed",
+        assumptions: ["The user selected each comparison pair."],
+        future_field: null,
+      },
+      rows: [{
+        row_id: "i-a",
+        source_ref: "src-a",
+        ledger_ref: "led-a",
+        income_label: "온라인 판매 수입",
+        source_amount: "100.10",
+        ledger_amount: "90.05",
+        expense_amount: "-2.50",
+        prepaid_tax_amount: "0",
+        evidence_refs: ["ev-income-a"],
+        category_status: "unclassified",
+        review_note: "Signed correction remains user supplied.",
+        review_owner: "reviewer",
+      }, {
+        row_id: "i-c",
+        source_ref: "src-c",
+        ledger_ref: null,
+        income_label: "기타 수입 기록",
+        source_amount: "0",
+        ledger_amount: null,
+        expense_amount: null,
+        prepaid_tax_amount: null,
+        evidence_refs: [],
+        category_status: "unclassified",
+        review_note: null,
+        review_owner: null,
+      }],
+    };
+    const { tools } = await client.listTools();
+    const tool = tools.find((item) => item.name === "tax_create_draft_bundle");
+    assert.deepEqual(tool.inputSchema.required?.slice().sort(), ["draft", "matter"]);
+    assert.equal(tool.annotations.openWorldHint, false);
+
+    const result = await client.callTool({ name: "tax_create_draft_bundle", arguments: { matter, draft } });
+    assert.deepEqual(result.structuredContent, { status: "accepted" });
+    assert.deepEqual(JSON.parse(result.content[0].text), { status: "accepted" });
+    assert.deepEqual(calls, [["create_tax_draft_bundle", { matter, draft }]],
+      "the bridge must preserve the complete income matter and draft without changing values or adding options");
+  } finally {
+    await client.close();
+  }
+});
+
+test("draft bundle description explains the income collection boundaries", async () => {
+  const fake = { async callTool() { return { status: "accepted" }; }, async close() {} };
+  const { client } = await connect(fake);
+  try {
+    const { tools } = await client.listTools();
+    const description = tools.find((item) => item.name === "tax_create_draft_bundle")?.description ?? "";
+    assert.match(description, /user-paired income source and ledger rows/i);
+    assert.match(description, /collected expense and prepaid-tax amounts/i);
+    assert.match(description, /income amounts are not aggregated across sources or used for tax computation/i);
+  } finally {
+    await client.close();
+  }
+});
+
 test("lecture and personal-service calculation facts pass through unchanged with a bounded evidence scope", async () => {
   const calls = [];
   const fake = { async callTool(name, args) { calls.push([name, args]); return { status: "ok" }; }, async close() {} };
